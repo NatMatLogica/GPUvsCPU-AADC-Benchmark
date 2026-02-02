@@ -179,6 +179,26 @@ def compute_cva_dva_cpu(pee_all, nee_all, grid, company_surv, ctrparty_surv):
     return cva, dva
 
 
+def compute_cva_dva_cpu_from_avg(avg_pee, avg_nee, grid, company_surv, ctrparty_surv):
+    """Compute CVA/DVA from pre-averaged PEE/NEE with given survival curves."""
+    n = len(grid.pricing_times)
+
+    comp = np.zeros(n)
+    ctrp = np.zeros(n)
+    for i in range(n):
+        t_q = int(grid.pricing_times[i])
+        comp[i] = discount_curve_eval(company_surv, t_q)
+        ctrp[i] = discount_curve_eval(ctrparty_surv, t_q)
+
+    cva = 0.0
+    dva = 0.0
+    for i in range(n - 1):
+        cva += (avg_pee[i] + avg_pee[i + 1]) * (ctrp[i] - ctrp[i + 1]) * 0.5
+        dva += (avg_nee[i] + avg_nee[i + 1]) * (comp[i] - comp[i + 1]) * 0.5
+
+    return cva, dva
+
+
 def run_cpu_baseline(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
                      company_surv, ctrparty_surv, mode="pricing_only"):
     """Run full CPU baseline: MC simulation + CVA/DVA."""
@@ -292,26 +312,49 @@ def cpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
             elapsed = time.perf_counter() - t0
             print(f"      MR point {i+1}/{n_mr} ({elapsed:.1f}s)")
 
-    # Bump survival curves
-    for name, surv in [("company", company_surv), ("counterparty", ctrparty_surv)]:
-        n_surv = len(surv.values)
-        print(f"    Bumping {n_surv} {name} survival curve points...")
-        for i in range(n_surv):
-            # Survival curve bumps don't require re-simulation,
-            # just re-integration of existing PEE/NEE.
-            # But for consistency with C++ we count them.
-            num_bumped += 1
+    # Bump survival curves (re-integration only, matches C++ AADC sensitivity set)
+    # Need base PEE/NEE for re-integration
+    pee_base = np.zeros((num_paths, num_pricing))
+    nee_base = np.zeros((num_paths, num_pricing))
+    for p in range(num_paths):
+        pee_base[p], nee_base[p] = cpu_simulate_path(
+            randoms[p], hw, grid, trades, csa, cumulat1, cumulat2)
+    avg_pee_base = pee_base.mean(axis=0)
+    avg_nee_base = nee_base.mean(axis=0)
 
-    # Bump spread curves
-    for sp_name, sp_vals in [("3m", hw.spread_3m_vals),
-                              ("6m", hw.spread_6m_vals),
-                              ("12m", hw.spread_12m_vals)]:
-        n_sp = len(sp_vals)
-        print(f"    Bumping {n_sp} spread {sp_name} points (counted, skip re-sim for CPU)...")
-        num_bumped += n_sp
+    n_ctrp = len(ctrparty_surv.values)
+    print(f"    Bumping {n_ctrp} counterparty survival curve points (re-integration)...")
+    for i in range(n_ctrp):
+        bumped_vals = ctrparty_surv.values.copy()
+        bumped_vals[i] += bump
+        # Re-integrate with bumped counterparty survival curve
+        bumped_surv = SurvivalCurveParams(
+            times_days=ctrparty_surv.times_days,
+            times_years=ctrparty_surv.times_years,
+            values=bumped_vals, t0=ctrparty_surv.t0)
+        compute_cva_dva_cpu_from_avg(avg_pee_base, avg_nee_base, grid,
+                                     company_surv, bumped_surv)
+        num_bumped += 1
+
+    n_comp = len(company_surv.values)
+    print(f"    Bumping {n_comp} company survival curve points (re-integration)...")
+    for i in range(n_comp):
+        bumped_vals = company_surv.values.copy()
+        bumped_vals[i] += bump
+        bumped_surv = SurvivalCurveParams(
+            times_days=company_surv.times_days,
+            times_years=company_surv.times_years,
+            values=bumped_vals, t0=company_surv.t0)
+        compute_cva_dva_cpu_from_avg(avg_pee_base, avg_nee_base, grid,
+                                     bumped_surv, ctrparty_surv)
+        num_bumped += 1
 
     sens_time = time.perf_counter() - t0
-    print(f"    Sensitivity: {num_bumped} params bumped in {sens_time:.1f}s")
+    total = num_bumped
+    n_resim = 2 + n_mr  # r0 + sigma + MR points
+    n_reint = n_ctrp + n_comp
+    print(f"    Sensitivity: {total} params total "
+          f"({n_resim} re-simulated + {n_reint} re-integrated) in {sens_time:.1f}s")
     return sens_time, num_bumped
 
 
@@ -365,7 +408,8 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
         print("  GPU bump-and-revalue for sensitivities...")
         sens_time, num_bumped = gpu_bump_and_revalue(
             randoms, hw, grid, trades, csa, cumulat1, cumulat2,
-            company_surv, ctrparty_surv, cva, dva, num_pricing)
+            company_surv, ctrparty_surv, cva, dva, num_pricing,
+            base_pee=pee_gpu, base_nee=nee_gpu)
 
     total_time = primal_time + sens_time
     print(f"  GPU done: CVA={cva:.10f}, DVA={dva:.10f}, "
@@ -386,13 +430,28 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
 
 def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
                          company_surv, ctrparty_surv, base_cva, base_dva,
-                         num_pricing):
-    """Bump-and-revalue loop on GPU for all sensitivity parameters."""
+                         num_pricing, base_pee=None, base_nee=None):
+    """Bump-and-revalue loop on GPU for all sensitivity parameters.
+
+    Matches the C++ AADC sensitivity set exactly:
+      - r0, sigma (require full MC re-simulation)
+      - Mean reversion curve points (require full MC re-simulation)
+      - Company survival curve points (re-integration only, no re-simulation)
+      - Counterparty survival curve points (re-integration only, no re-simulation)
+    """
     from xva_gpu_kernel import run_gpu_simulation, compute_cva_dva
 
     bump = 1e-4
     t0 = time.perf_counter()
-    num_bumped = 0
+    num_resim = 0   # bumps requiring full GPU re-simulation
+    num_reint = 0   # bumps requiring only re-integration (CPU-side)
+
+    # Use pre-computed base PEE/NEE for survival curve re-integration
+    if base_pee is None or base_nee is None:
+        base_pee, base_nee = run_gpu_simulation(
+            randoms, hw, grid, trades, csa, cumulat1, cumulat2, num_pricing)
+    avg_pee_base = base_pee.mean(axis=0)
+    avg_nee_base = base_nee.mean(axis=0)
 
     def _cva_dva(pee, nee):
         return compute_cva_dva(
@@ -400,6 +459,27 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
             company_surv.times_years, company_surv.values,
             ctrparty_surv.times_years, ctrparty_surv.values,
             company_surv.t0, ctrparty_surv.t0)
+
+    def _cva_dva_with_surv(avg_pee, avg_nee, comp_vals, ctrp_vals):
+        """CVA/DVA from pre-averaged exposures with custom survival curves."""
+        n = len(grid.pricing_times)
+        comp = np.zeros(n)
+        ctrp = np.zeros(n)
+        for i in range(n):
+            t_q = int(grid.pricing_times[i])
+            t_y = t_q / 365.0
+            comp_rate = pw_interp(company_surv.times_years, comp_vals, t_y)
+            ctrp_rate = pw_interp(ctrparty_surv.times_years, ctrp_vals, t_y)
+            comp_yf = (t_q - company_surv.t0) / 365.0
+            ctrp_yf = (t_q - ctrparty_surv.t0) / 365.0
+            comp[i] = math.exp(-comp_rate * comp_yf)
+            ctrp[i] = math.exp(-ctrp_rate * ctrp_yf)
+        cva = 0.0
+        dva = 0.0
+        for i in range(n - 1):
+            cva += (avg_pee[i] + avg_pee[i + 1]) * (ctrp[i] - ctrp[i + 1]) * 0.5
+            dva += (avg_nee[i] + avg_nee[i + 1]) * (comp[i] - comp[i + 1]) * 0.5
+        return cva, dva
 
     # Bump r0
     hw_b = HWModelParams(
@@ -412,7 +492,7 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
     pee_b, nee_b = run_gpu_simulation(randoms, hw_b, grid, trades, csa,
                                        cumulat1, cumulat2, num_pricing)
     cva_b, dva_b = _cva_dva(pee_b, nee_b)
-    num_bumped += 1
+    num_resim += 1
     print(f"    r0: dCVA/dr0 = {(cva_b - base_cva) / bump:.6f}")
 
     # Bump sigma
@@ -426,10 +506,10 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
     pee_b2, nee_b2 = run_gpu_simulation(randoms, hw_b2, grid, trades, csa,
                                           cumulat1, cumulat2, num_pricing)
     cva_b2, dva_b2 = _cva_dva(pee_b2, nee_b2)
-    num_bumped += 1
+    num_resim += 1
     print(f"    sigma: dCVA/dsigma = {(cva_b2 - base_cva) / bump:.6f}")
 
-    # Bump mean reversion curve points
+    # Bump mean reversion curve points (requires full re-simulation)
     n_mr = len(hw.mean_rev_vals)
     print(f"    Bumping {n_mr} mean reversion points on GPU...")
     for i in range(n_mr):
@@ -445,45 +525,38 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
         )
         run_gpu_simulation(randoms, hw_bi, grid, trades, csa,
                            cum1_b, cum2_b, num_pricing)
-        num_bumped += 1
+        num_resim += 1
         if (i + 1) % 50 == 0:
             elapsed = time.perf_counter() - t0
             print(f"      MR point {i+1}/{n_mr} ({elapsed:.1f}s)")
 
-    # Bump spread curves
-    for sp_name, sp_times, sp_vals, sp_idx in [
-        ("3m", hw.spread_3m_times, hw.spread_3m_vals, 0),
-        ("6m", hw.spread_6m_times, hw.spread_6m_vals, 1),
-        ("12m", hw.spread_12m_times, hw.spread_12m_vals, 2),
-    ]:
-        n_sp = len(sp_vals)
-        print(f"    Bumping {n_sp} spread {sp_name} points on GPU...")
-        for i in range(n_sp):
-            bumped_vals = sp_vals.copy()
-            bumped_vals[i] += bump
-            hw_sp = HWModelParams(
-                alpha=hw.alpha, sigma=hw.sigma, r0=hw.r0,
-                mean_rev_times=hw.mean_rev_times, mean_rev_vals=hw.mean_rev_vals,
-                spread_3m_times=hw.spread_3m_times if sp_idx != 0 else sp_times,
-                spread_3m_vals=hw.spread_3m_vals if sp_idx != 0 else bumped_vals,
-                spread_6m_times=hw.spread_6m_times if sp_idx != 1 else sp_times,
-                spread_6m_vals=hw.spread_6m_vals if sp_idx != 1 else bumped_vals,
-                spread_12m_times=hw.spread_12m_times if sp_idx != 2 else sp_times,
-                spread_12m_vals=hw.spread_12m_vals if sp_idx != 2 else bumped_vals,
-            )
-            run_gpu_simulation(randoms, hw_sp, grid, trades, csa,
-                               cumulat1, cumulat2, num_pricing)
-            num_bumped += 1
-        elapsed = time.perf_counter() - t0
-        print(f"      Done {sp_name} ({elapsed:.1f}s)")
+    # Bump counterparty survival curve points (re-integration only, no re-simulation)
+    n_ctrp = len(ctrparty_surv.values)
+    print(f"    Bumping {n_ctrp} counterparty survival curve points (re-integration)...")
+    for i in range(n_ctrp):
+        bumped_vals = ctrparty_surv.values.copy()
+        bumped_vals[i] += bump
+        cva_s, dva_s = _cva_dva_with_surv(
+            avg_pee_base, avg_nee_base,
+            company_surv.values, bumped_vals)
+        num_reint += 1
 
-    # Survival curve bumps: only re-integrate, no re-simulation
-    for name, surv in [("company", company_surv), ("counterparty", ctrparty_surv)]:
-        num_bumped += len(surv.values)
+    # Bump company survival curve points (re-integration only, no re-simulation)
+    n_comp = len(company_surv.values)
+    print(f"    Bumping {n_comp} company survival curve points (re-integration)...")
+    for i in range(n_comp):
+        bumped_vals = company_surv.values.copy()
+        bumped_vals[i] += bump
+        cva_s, dva_s = _cva_dva_with_surv(
+            avg_pee_base, avg_nee_base,
+            bumped_vals, ctrparty_surv.values)
+        num_reint += 1
 
     sens_time = time.perf_counter() - t0
-    print(f"    GPU sensitivity: {num_bumped} params bumped in {sens_time:.1f}s")
-    return sens_time, num_bumped
+    total_bumped = num_resim + num_reint
+    print(f"    GPU sensitivity: {total_bumped} params total "
+          f"({num_resim} re-simulated + {num_reint} re-integrated) in {sens_time:.1f}s")
+    return sens_time, total_bumped
 
 
 # ---------------------------------------------------------------------------
@@ -714,16 +787,15 @@ def main():
     num_steps = len(grid.model_times)
     num_pricing = int(grid.is_pricing.sum())
     n_mr = len(hw.mean_rev_vals)
-    n_sp = len(hw.spread_3m_vals) + len(hw.spread_6m_vals) + len(hw.spread_12m_vals)
     n_surv = len(company_surv.values) + len(ctrparty_surv.values)
-    num_sens_params = 2 + n_mr + n_sp + n_surv  # r0 + sigma + curves
+    num_sens_params = 2 + n_mr + n_surv  # r0 + sigma + MR curve + survival curves
 
     ref_cva, ref_dva = load_reference_results()
 
     print(f"Grid: {num_steps} model steps, {num_pricing} pricing times")
     print(f"Portfolio: {num_trades} trades, {num_periods} CFs each")
     print(f"Sensitivity params: {num_sens_params} (r0, sigma, {n_mr} MR, "
-          f"{n_sp} spread, {n_surv} survival)")
+          f"{n_surv} survival)")
     if ref_cva is not None:
         print(f"C++ reference: CVA={ref_cva:.10f}, DVA={ref_dva:.10f}")
 

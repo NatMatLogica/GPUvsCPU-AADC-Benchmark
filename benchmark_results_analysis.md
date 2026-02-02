@@ -88,16 +88,48 @@ These are the **AADC evaluation** times (not primal), but they're surprisingly l
 
 The GPU shows near-constant overhead up to ~10K paths, then scales linearly - characteristic of good GPU utilization.
 
-## GPU vs AADC - The Real Comparison
+## GPU vs AADC - Fair Comparison (Evaluation Time Only)
 
-| Scenario | GPU (pricing only) | AADC (pricing + all Greeks) |
+AADC compilation/recording is a **one-time cost** - the kernel is cached in `m_func_request_cache` and reused across evaluations. For a fair comparison, only evaluation time should be used.
+
+### Small Portfolio (5 trades, 16 MC paths)
+
+| Backend | What you get | Eval Time |
 |---|---|---|
-| 5 trades, 16 paths | 0.018s | 0.024s eval + 0.77s compile |
-| 50 trades, 4096 paths | 0.72s | ~0.2s eval + 1.87s compile |
+| **AADC C++ (1 thread)** | Prices + all Greeks | **0.024s** |
+| **GPU brute-force** | Prices only | **0.018s** |
 
-For **repeated evaluations** (where the kernel is compiled once and reused via `m_func_request_cache`):
-- AADC gives you **prices + full gradient** in roughly the same order as GPU gives you prices-only
-- The 0.70-0.78% relative performance means AADC's (forward + 2 reverse) costs < 1% of a single primal - the kernel reuse is working as intended
+AADC delivers prices + full gradient in roughly the same time as GPU prices-only. For repeated evaluations, AADC is the clear winner since GPU would need bump-and-revalue for Greeks.
+
+### Medium Portfolio (50 trades, 4096 MC paths)
+
+| Backend | What you get | Eval Time |
+|---|---|---|
+| **AADC C++ (1 thread)** | Prices + all Greeks | **~0.2s** (0.78% relative perf) |
+| **GPU brute-force** | Prices only | **0.72s** |
+
+AADC is **3.6x faster** than GPU even though AADC computes the full gradient. To get equivalent Greeks on GPU via bump-and-revalue: 8 params x 0.72s = ~5.8s minimum.
+
+### Large Portfolio (200 trades, 16384 MC paths) - `bank_medium.json`
+
+| Backend | What you get | Eval Time | Notes |
+|---|---|---|---|
+| **AADC C++ (16 threads)** | Prices + all Greeks | **186.5s** | 1.4GB kernel, cache-bound |
+| **GPU brute-force (H100)** | Prices only | **7.4s** | |
+
+GPU is **25x faster** for pricing-only. However, to get equivalent Greeks on GPU via bump-and-revalue would cost at least 8 params x 7.4s = ~59s. So AADC with full Greeks is **~3x slower** than GPU bump-and-revalue would be.
+
+The bottleneck is the **kernel size**: 590MB forward + 805MB reverse = 1.4GB total. This far exceeds CPU L3 cache, causing every MC iteration to be memory-bound. For comparison, the 50-trade kernel was 26MB and ran efficiently.
+
+### Summary Table (Eval Time Only, Excluding Compilation)
+
+| Portfolio | AADC Eval (prices+Greeks) | GPU (prices only) | GPU bump-and-revalue (est.) | AADC vs GPU B&R |
+|---|---|---|---|---|
+| 5 trades, 16 paths | 0.024s | 0.018s | ~0.14s | **5.8x faster** |
+| 50 trades, 4096 paths | ~0.2s | 0.72s | ~5.8s | **29x faster** |
+| 200 trades, 16384 paths | 186.5s | 7.4s | ~59s | **3.2x slower** |
+
+AADC scales well up to the point where the compiled kernel fits in CPU cache. Beyond that, cache thrashing dominates and GPU brute-force becomes competitive even with bump-and-revalue overhead.
 
 ## CVA/DVA Values Across Backends
 
