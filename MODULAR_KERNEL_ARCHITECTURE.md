@@ -157,9 +157,35 @@ Both achieve **O(1) kernel reuse** for new trades of existing types.
 2. **Stream processing**: Don't store all trade values; aggregate on-the-fly
 3. **AADC integration**: Apply same architecture to C++ AADC for consistent speedups
 
+## AADC Implementation (SIMM-style)
+
+The `xva_aadc_modular.py` implements the same architecture using AADC:
+
+```python
+# Record CSA+CVA kernel (takes V_portfolio as input)
+with aadc.record_kernel() as funcs:
+    v_portfolio = [aadc.idouble(0.0).mark_as_input() for t in range(num_pricing_times)]
+    # ... CSA evolution, CVA/DVA integration ...
+    cva.mark_as_output()
+    dva.mark_as_output()
+
+# Evaluate (reuses kernel for all paths)
+inputs = {v_handles[t]: portfolio_values[:, t] for t in range(num_pricing_times)}
+results = aadc.evaluate(funcs, request, inputs, workers)
+```
+
+### AADC Results (100 trades, 1000 paths)
+
+| Scenario | Kernel Recording | Trade Valuation | CVA/DVA | Total |
+|----------|------------------|-----------------|---------|-------|
+| Full Portfolio | 66ms | 1840ms | 3ms | 1909ms |
+| Market Update | **0ms (reused)** | 1828ms | 3ms | 1830ms |
+| New Trade | **0ms (reused)** | 3ms | 3ms | **6ms** |
+
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `xva_modular_kernel.py` | Two-kernel implementation with benchmarks |
+| `xva_modular_kernel.py` | GPU two-kernel implementation |
+| `xva_aadc_modular.py` | AADC two-kernel implementation (SIMM-style) |
 | `MODULAR_KERNEL_ARCHITECTURE.md` | This documentation |
