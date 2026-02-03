@@ -140,7 +140,7 @@ static const char* CSV_HEADER =
     "backend,mode,cva_result,dva_result,"
     "eval_time_sec,sensitivity_time_sec,total_time_sec,"
     "kernel_recording_sec,num_params_bumped,speedup_vs_cpu,"
-    "max_cva_diff,max_dva_diff,gpu_kernel_time_sec,status\n";
+    "max_cva_diff,max_dva_diff,gpu_kernel_time_sec,memory_mb,throughput_paths_per_sec,status\n";
 
 void log_xva_csv(
     const std::string& csv_path,
@@ -150,11 +150,11 @@ void log_xva_csv(
     int num_sensitivity_params, int num_threads,
     const std::string& backend, const std::string& mode,
     double cva, double dva,
-    double primal_time_sec, double sensitivity_time_sec,
+    double eval_time_sec, double sensitivity_time_sec,
     double total_time_sec, double kernel_recording_sec,
     int num_params_bumped, double speedup_vs_cpu,
     double max_cva_diff, double max_dva_diff,
-    double gpu_kernel_time_sec,
+    double gpu_kernel_time_sec, double memory_mb,
     const std::string& status
 ) {
     // Check if file exists to decide whether to write header
@@ -169,6 +169,10 @@ void log_xva_csv(
     if (!file_exists) {
         csv << CSV_HEADER;
     }
+
+    // Compute throughput (paths/second)
+    double throughput = (eval_time_sec > 0) ? num_mc_paths / eval_time_sec : 0.0;
+
     csv << std::setprecision(15)
         << get_iso_timestamp() << ","
         << model_name << ","
@@ -183,7 +187,7 @@ void log_xva_csv(
         << mode << ","
         << cva << ","
         << dva << ","
-        << primal_time_sec << ","
+        << eval_time_sec << ","
         << sensitivity_time_sec << ","
         << total_time_sec << ","
         << kernel_recording_sec << ","
@@ -192,6 +196,8 @@ void log_xva_csv(
         << max_cva_diff << ","
         << max_dva_diff << ","
         << gpu_kernel_time_sec << ","
+        << memory_mb << ","
+        << throughput << ","
         << status << "\n";
     csv.close();
 }
@@ -396,13 +402,30 @@ int run_pricing(const int threads_num, const std::string input_file) {
     double max_cva_diff = std::abs(primal_cva - reported_cva);
     double max_dva_diff = std::abs(primal_dva - reported_dva);
 
+    // Extract AADC memory usage from compiler data (in MB)
+    double aadc_memory_mb = 0.0;
+    if (data_out.contains("compiler data")) {
+        auto& cd = data_out["compiler data"];
+        double code_fwd = cd.contains("Code size forward") ? cd["Code size forward"].get<double>() : 0;
+        double code_rev = cd.contains("Code size reverse") ? cd["Code size reverse"].get<double>() : 0;
+        double const_data = cd.contains("Const data size") ? cd["Const data size"].get<double>() : 0;
+        double stack_size = cd.contains("Stack size") ? cd["Stack size"].get<double>() : 0;
+        aadc_memory_mb = (code_fwd + code_rev + const_data + stack_size) / (1024.0 * 1024.0);
+    }
+
+    // Estimate primal memory: random array + exposure arrays + trade data
+    // randoms: num_mc_paths * num_model_steps * 8 bytes
+    // exposures: num_mc_paths * num_pricing_times * 2 * 8 bytes
+    double primal_memory_mb = (double(num_mc_paths) * num_model_steps * 8 +
+                               double(num_mc_paths) * num_pricing_times * 2 * 8) / (1024.0 * 1024.0);
+
     // Log primal row
     if (obj->m_primal_is_required) {
         log_xva_csv(csv_path, "xva_cpp_primal", num_trades, num_mc_paths,
             num_model_steps, num_pricing_times, num_sens, threads_num,
             "cpp_double", mode, primal_cva, primal_dva,
             primal_time_sec, 0.0, primal_time_sec,
-            0.0, 0, 0.0, 0.0, 0.0, 0.0, "success");
+            0.0, 0, 0.0, 0.0, 0.0, 0.0, primal_memory_mb, "success");
     }
 
     // Log AADC row
@@ -412,7 +435,7 @@ int run_pricing(const int threads_num, const std::string input_file) {
         "cpp_aadc_avx256", mode, reported_cva, reported_dva,
         aadc_time_sec, 0.0, aadc_time_sec + compilation_sec,
         compilation_sec, 0, speedup,
-        max_cva_diff, max_dva_diff, 0.0, "success");
+        max_cva_diff, max_dva_diff, 0.0, aadc_memory_mb, "success");
 
     std::cout << "\nResults logged to " << csv_path << "\n";
 

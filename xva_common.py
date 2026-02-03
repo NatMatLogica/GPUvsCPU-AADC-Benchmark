@@ -508,7 +508,7 @@ LOG_COLUMNS = [
     "eval_time_sec", "sensitivity_time_sec", "total_time_sec",
     "kernel_recording_sec", "num_params_bumped",
     "speedup_vs_cpu", "max_cva_diff", "max_dva_diff",
-    "gpu_kernel_time_sec", "status",
+    "gpu_kernel_time_sec", "memory_mb", "throughput_paths_per_sec", "status",
 ]
 
 
@@ -532,6 +532,7 @@ def build_log_row(result: XVAResult, grid: SimulationGrid,
                   cpu_time: float = 0.0,
                   ref_cva: float = 0.0, ref_dva: float = 0.0) -> dict:
     speedup = cpu_time / result.total_time_sec if result.total_time_sec > 0 and cpu_time > 0 else 0.0
+    throughput = num_mc_paths / result.eval_time_sec if result.eval_time_sec > 0 else 0.0
     return {
         "timestamp": datetime.now().isoformat(),
         "model_name": f"xva_{result.mode}_{result.backend}",
@@ -555,6 +556,7 @@ def build_log_row(result: XVAResult, grid: SimulationGrid,
         "max_cva_diff": abs(result.cva - ref_cva) if ref_cva is not None else "",
         "max_dva_diff": abs(result.dva - ref_dva) if ref_dva is not None else "",
         "gpu_kernel_time_sec": result.gpu_kernel_time_sec,
-        "gpu_memory_mb": result.gpu_memory_mb,
+        "memory_mb": result.gpu_memory_mb,
+        "throughput_paths_per_sec": throughput,
         "status": "success",
     }
