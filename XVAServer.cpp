@@ -428,13 +428,13 @@ int run_pricing(const int threads_num, const std::string input_file) {
             0.0, 0, 0.0, 0.0, 0.0, 0.0, primal_memory_mb, "success");
     }
 
-    // Log AADC row
+    // Log AADC row (sensitivity_time = eval_time since AD computes both in same pass)
     double speedup = (primal_time_sec > 0) ? primal_time_sec / aadc_time_sec : 0;
     log_xva_csv(csv_path, "xva_cpp_aadc", num_trades, num_mc_paths,
         num_model_steps, num_pricing_times, num_sens, threads_num,
         "cpp_aadc_avx256", mode, reported_cva, reported_dva,
-        aadc_time_sec, 0.0, aadc_time_sec + compilation_sec,
-        compilation_sec, 0, speedup,
+        aadc_time_sec, aadc_time_sec, aadc_time_sec + compilation_sec,
+        compilation_sec, num_sens, speedup,
         max_cva_diff, max_dva_diff, 0.0, aadc_memory_mb, "success");
 
     std::cout << "\nResults logged to " << csv_path << "\n";
