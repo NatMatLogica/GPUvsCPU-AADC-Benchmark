@@ -224,6 +224,9 @@ public:
 #endif
         m_primal_and_bumps_are_required=m_data["Primal and Bumps Are Required"].template get<bool>();
         m_selective_bumps=m_data["Selective bumps"].template get<int>();
+        // Skip MR sensitivities for fair comparison with pathwise GPU (default: false)
+        m_skip_mr_sensitivities = m_data.contains("Skip MR Sensitivities")
+            ? m_data["Skip MR Sensitivities"].template get<bool>() : false;
     }
 
     //////////////////////////////////////////////////////
@@ -291,7 +294,7 @@ public:
     int m_mc_iterations, m_AVX_size, m_AVX_iterations, m_primal_mc_iterations; 
     double m_norm_coeff;
     bool m_primal_is_required, m_primal_and_bumps_are_required, m_selective_bumps
-        , m_forward_only
+        , m_forward_only, m_skip_mr_sensitivities
     ;
 #ifdef HAS_ADEPT
     bool m_adept_is_required;
@@ -415,10 +418,15 @@ void XVAJobRequest<mmType>::compileAADFunction(const json& request_data) {
             m_xva_diff_args.ir_crvs[0].r0= aad_XVA.getModel()->getR0().markAsDiff();
             m_xva_diff_args.ir_crvs[0].sigma= aad_XVA.getModel()->getSigma().markAsDiff();
 
-            for (int i=0; i<aad_XVA.getModel()->getMeanRev()->getVals().size(); i++) {
-                m_xva_diff_args.ir_crvs[0].mr_crv.
-                    push_back(aad_XVA.getModel()->getMeanRev()->getVals()[i].markAsDiff())
-                ;
+            // MR sensitivities - skip if m_skip_mr_sensitivities is true
+            if (!m_skip_mr_sensitivities) {
+                for (int i=0; i<aad_XVA.getModel()->getMeanRev()->getVals().size(); i++) {
+                    m_xva_diff_args.ir_crvs[0].mr_crv.
+                        push_back(aad_XVA.getModel()->getMeanRev()->getVals()[i].markAsDiff())
+                    ;
+                }
+            } else {
+                std::cout << "  Skipping MR sensitivities (Skip MR Sensitivities=true)" << std::endl;
             }
             for (int i=0; i<aad_XVA.getCompSurvCurv()->getZeroRatesVector().size(); i++) {
                 m_xva_diff_args.company_surv_crv.default_rates.

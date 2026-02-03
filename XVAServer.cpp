@@ -347,7 +347,12 @@ int run_pricing(const int threads_num, const std::string input_file) {
     int comp_step = data_in["CompanySurvivalCurve"]["step"].get<int>();
     int n_comp_surv = comp_T / comp_step + 1;
 
-    int num_sens = 2 + n_mr + n_ctrp_surv + n_comp_surv;  // r0, sigma, MR, survival curves
+    // Check if MR sensitivities are skipped
+    bool skip_mr = data_in.contains("Skip MR Sensitivities")
+        ? data_in["Skip MR Sensitivities"].get<bool>() : false;
+    int num_sens = skip_mr
+        ? (2 + n_ctrp_surv + n_comp_surv)               // r0, sigma, survival curves (no MR)
+        : (2 + n_mr + n_ctrp_surv + n_comp_surv);       // r0, sigma, MR, survival curves
 
     // Extract results
     double primal_cva = 0, primal_dva = 0, aadc_cva = 0, aadc_dva = 0;

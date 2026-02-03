@@ -110,18 +110,28 @@ run_aadc() {
     local mc_paths
     mc_paths=$(python3 -c "import json; d=json.load(open('$config_file')); print(d.get('MCPaths', 256))")
 
-    # If primal excluded, create temp config with "Primal Is Requred": false
-    if ! $RUN_PRIMAL; then
-        actual_config=".tmp_$(basename "$config_file" .json)_no_primal.json"
+    # Create temp config if any flags need modification
+    local need_temp=false
+    local flags_desc=""
+    ! $RUN_PRIMAL && { need_temp=true; flags_desc="primal=off"; }
+    $SKIP_MR_BUMPS && { need_temp=true; flags_desc="${flags_desc:+$flags_desc, }mr=off"; }
+
+    if $need_temp; then
+        actual_config=".tmp_$(basename "$config_file" .json)_modified.json"
+        local skip_primal=$( $RUN_PRIMAL && echo "False" || echo "True" )
+        local skip_mr=$( $SKIP_MR_BUMPS && echo "True" || echo "False" )
         python3 -c "
 import json
 with open('$config_file') as f:
     d = json.load(f)
-d['Primal Is Requred'] = False
+if $skip_primal:
+    d['Primal Is Requred'] = False
+if $skip_mr:
+    d['Skip MR Sensitivities'] = True
 with open('$actual_config', 'w') as f:
     json.dump(d, f, indent=4)
 "
-        echo "  AADC C++: $config_file (primal disabled), $mc_paths paths, $THREADS threads"
+        echo "  AADC C++: $config_file ($flags_desc), $mc_paths paths, $THREADS threads"
     else
         echo "  AADC C++: $config_file, $mc_paths paths, $THREADS threads"
     fi
