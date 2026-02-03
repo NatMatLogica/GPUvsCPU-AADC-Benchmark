@@ -10,6 +10,7 @@
 #   ./run_benchmark.sh micro -x aadc        # run micro, exclude AADC
 #   ./run_benchmark.sh micro -x gpu         # run micro, exclude GPU backends
 #   ./run_benchmark.sh small -x aadc,pathwise  # exclude multiple backends
+#   ./run_benchmark.sh small -x primal      # run AADC without slow primal baseline
 #   THREADS=8 ./run_benchmark.sh medium     # override thread count via env
 #
 # Backends: aadc (C++), gpu (brute-force), pathwise (GPU pathwise derivatives)
@@ -71,6 +72,7 @@ fi
 RUN_AADC=true
 RUN_GPU=true
 RUN_PATHWISE=true
+RUN_PRIMAL=true
 
 if [[ -n "$EXCLUDE" ]]; then
     IFS=',' read -ra EXCL_ARRAY <<< "$EXCLUDE"
@@ -79,13 +81,14 @@ if [[ -n "$EXCLUDE" ]]; then
             aadc) RUN_AADC=false ;;
             gpu) RUN_GPU=false ;;
             pathwise) RUN_PATHWISE=false ;;
+            primal) RUN_PRIMAL=false ;;
             *) echo "Warning: unknown backend to exclude: $excl" ;;
         esac
     done
 fi
 
 echo "Threads: $THREADS"
-echo "Backends: aadc=$RUN_AADC, gpu=$RUN_GPU, pathwise=$RUN_PATHWISE"
+echo "Backends: aadc=$RUN_AADC (primal=$RUN_PRIMAL), gpu=$RUN_GPU, pathwise=$RUN_PATHWISE"
 
 separator() {
     echo ""
@@ -99,10 +102,25 @@ separator() {
 # ------------------------------------------------------------------
 run_aadc() {
     local config_file="$1"
+    local actual_config="$config_file"
     local mc_paths
     mc_paths=$(python3 -c "import json; d=json.load(open('$config_file')); print(d.get('MCPaths', 256))")
 
-    echo "  AADC C++: $config_file, $mc_paths paths, $THREADS threads"
+    # If primal excluded, create temp config with "Primal Is Requred": false
+    if ! $RUN_PRIMAL; then
+        actual_config="/tmp/$(basename "$config_file" .json)_no_primal.json"
+        python3 -c "
+import json
+with open('$config_file') as f:
+    d = json.load(f)
+d['Primal Is Requred'] = False
+with open('$actual_config', 'w') as f:
+    json.dump(d, f, indent=4)
+"
+        echo "  AADC C++: $config_file (primal disabled), $mc_paths paths, $THREADS threads"
+    else
+        echo "  AADC C++: $config_file, $mc_paths paths, $THREADS threads"
+    fi
 
     if [[ ! -x "$AADC_BINARY" ]]; then
         echo "  ERROR: $AADC_BINARY not found. Build with:"
@@ -110,8 +128,8 @@ run_aadc() {
         return 1
     fi
 
-    echo "  Command: $AADC_BINARY $config_file $mc_paths $THREADS"
-    time "$AADC_BINARY" "$config_file" "$mc_paths" "$THREADS"
+    echo "  Command: $AADC_BINARY $actual_config $mc_paths $THREADS"
+    time "$AADC_BINARY" "$actual_config" "$mc_paths" "$THREADS"
     echo ""
 }
 
