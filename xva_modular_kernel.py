@@ -32,7 +32,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from numba import cuda, float64, int32
+from datetime import datetime
+from pathlib import Path
 import math
+
+# Import logging utilities
+from xva_common import write_xva_log, LOG_COLUMNS
+
+BASE_DIR = Path(__file__).parent
+LOG_FILE = str(BASE_DIR / "data" / "execution_log_xva.csv")
 
 # =============================================================================
 # Data Structures
@@ -709,6 +717,44 @@ def build_survival_curve(num_pricing_times: int, hazard_rate: float = 0.02) -> n
     return np.exp(-hazard_rate * times)
 
 
+def log_modular_result(scenario: str, num_trades: int, num_paths: int,
+                       num_steps: int, num_pricing_times: int,
+                       num_trade_types: int, cva: float, dva: float,
+                       eval_time: float, compile_time: float, total_time: float,
+                       kernels_compiled: int, kernels_reused: int,
+                       memory_mb: float = 0.0):
+    """Log benchmark result to CSV."""
+    row = {
+        'timestamp': datetime.now().isoformat(),
+        'model_name': f'xva_modular_{scenario}',
+        'model_version': '1.0.0',
+        'num_trades': num_trades,
+        'num_mc_paths': num_paths,
+        'num_model_steps': num_steps,
+        'num_pricing_times': num_pricing_times,
+        'num_sensitivity_params': num_trade_types,  # Use for trade types
+        'num_threads': 1,  # GPU
+        'backend': 'modular_gpu',
+        'mode': 'pricing_with_greeks',
+        'cva_result': cva,
+        'dva_result': dva,
+        'eval_time_sec': eval_time,
+        'sensitivity_time_sec': eval_time,  # Included in same pass
+        'total_time_sec': total_time,
+        'kernel_recording_sec': compile_time,
+        'num_params_bumped': kernels_compiled,
+        'speedup_vs_cpu': kernels_reused,  # Reuse count in this field
+        'max_cva_diff': 0.0,
+        'max_dva_diff': 0.0,
+        'gpu_kernel_time_sec': eval_time,
+        'memory_mb': memory_mb,
+        'throughput_paths_per_sec': num_paths / total_time if total_time > 0 else 0,
+        'status': 'success',
+    }
+    write_xva_log(LOG_FILE, [row])
+    print(f"  Results logged to {LOG_FILE}")
+
+
 # =============================================================================
 # Main Benchmark
 # =============================================================================
@@ -782,6 +828,23 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 51200,
         print(f"    Kernel reuses:        {result['kernel_stats']['kernels_reused']}")
         print(f"    Total compile time:   {result['kernel_stats']['total_compile_time_sec']*1000:.1f}ms")
 
+        # Log to CSV
+        log_modular_result(
+            scenario='full_portfolio',
+            num_trades=num_trades,
+            num_paths=num_paths,
+            num_steps=grid['num_steps'],
+            num_pricing_times=grid['num_pricing_times'],
+            num_trade_types=num_trade_types,
+            cva=result['cva'],
+            dva=result['dva'],
+            eval_time=result['valuation_time_sec'],
+            compile_time=result['kernel_stats']['total_compile_time_sec'],
+            total_time=result['total_time_sec'],
+            kernels_compiled=result['kernel_stats']['kernels_compiled'],
+            kernels_reused=result['kernel_stats']['kernels_reused'],
+        )
+
         # Save for incremental test
         base_portfolio_values = result.get('portfolio_values', None)
         rates = engine.simulate_rates(randoms)  # Cache rates
@@ -820,6 +883,23 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 51200,
         print(f"    Kernels compiled: {result2['kernel_stats']['kernels_compiled']} (should be 0)")
         print(f"    Kernel reuses:    {result2['kernel_stats']['kernels_reused']} (should be {num_trades})")
 
+        # Log to CSV
+        log_modular_result(
+            scenario='market_update',
+            num_trades=num_trades,
+            num_paths=num_paths,
+            num_steps=grid['num_steps'],
+            num_pricing_times=grid['num_pricing_times'],
+            num_trade_types=num_trade_types,
+            cva=result2['cva'],
+            dva=result2['dva'],
+            eval_time=result2['valuation_time_sec'],
+            compile_time=result2['kernel_stats']['total_compile_time_sec'],
+            total_time=result2['total_time_sec'],
+            kernels_compiled=result2['kernel_stats']['kernels_compiled'],
+            kernels_reused=result2['kernel_stats']['kernels_reused'],
+        )
+
     # === Scenario 3: New Trade (Incremental) ===
     if scenario in ['all', 'new_trade']:
         print()
@@ -846,6 +926,23 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 51200,
         print(f"    CVA/DVA calc:  {result3a['cva_time_sec']*1000:.1f}ms")
         print(f"    CVA: {result3a['cva']:.6f}")
 
+        # Log to CSV
+        log_modular_result(
+            scenario='new_trade_existing_type',
+            num_trades=num_trades + 1,
+            num_paths=num_paths,
+            num_steps=grid['num_steps'],
+            num_pricing_times=grid['num_pricing_times'],
+            num_trade_types=num_trade_types,
+            cva=result3a['cva'],
+            dva=result3a['dva'],
+            eval_time=result3a['valuation_time_sec'],
+            compile_time=result3a['kernel_compile_time_sec'],
+            total_time=result3a['valuation_time_sec'] + result3a['cva_time_sec'],
+            kernels_compiled=0 if result3a['kernel_reused'] else 1,
+            kernels_reused=1 if result3a['kernel_reused'] else 0,
+        )
+
         # Add new trade of NEW type (kernel compilation required)
         print("\n  --- Adding trade of NEW type (kernel compiled) ---")
         new_trade_new = TradeData(
@@ -870,6 +967,23 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 51200,
         print(f"    Valuation:     {result3b['valuation_time_sec']*1000:.1f}ms")
         print(f"    CVA/DVA calc:  {result3b['cva_time_sec']*1000:.1f}ms")
         print(f"    CVA: {result3b['cva']:.6f}")
+
+        # Log to CSV
+        log_modular_result(
+            scenario='new_trade_new_type',
+            num_trades=num_trades + 1,
+            num_paths=num_paths,
+            num_steps=grid['num_steps'],
+            num_pricing_times=grid['num_pricing_times'],
+            num_trade_types=num_trade_types + 1,
+            cva=result3b['cva'],
+            dva=result3b['dva'],
+            eval_time=result3b['valuation_time_sec'],
+            compile_time=result3b['kernel_compile_time_sec'],
+            total_time=result3b['valuation_time_sec'] + result3b['cva_time_sec'],
+            kernels_compiled=0 if result3b['kernel_reused'] else 1,
+            kernels_reused=1 if result3b['kernel_reused'] else 0,
+        )
 
     # === Final Summary ===
     print()
