@@ -62,6 +62,45 @@ This exceeds typical GPU memory. Possible future approaches:
 
 For fair comparison between backends, use `--skip-mr-bumps` to exclude MR from brute-force (124 params instead of 244).
 
+### Sensitivity Parameter Counts (initData.json)
+
+The default config (`initData.json`) has:
+
+| Parameter | Count | Notes |
+|-----------|-------|-------|
+| r0 | 1 | Short rate |
+| sigma | 1 | Volatility |
+| Mean reversion curve | 250 | T=50yr, step=0.2yr |
+| Counterparty survival | 140 | T=14000d, step=100d |
+| Company survival | 140 | T=14000d, step=100d |
+| **Total** | **532** | |
+
+**Benchmark configurations:**
+
+| Config | Params | Command Flag |
+|--------|--------|--------------|
+| GPU (skip MR) | 282 | default |
+| GPU (full) | 532 | `--include-mr-bumps` |
+| AADC | 532 | always computes all |
+
+**Why AADC cannot compute 282 params:**
+
+AADC computes all 532 sensitivities in a **single reverse pass** — the cost is O(1) regardless of parameter count. There's no way to "skip" MR sensitivities because they're computed together with all other gradients in the same backward sweep. This is the fundamental advantage of adjoint AD.
+
+**Crossover analysis (100 trades, 10K paths):**
+
+| Params | GPU Brute-Force | AADC C++ | Winner |
+|--------|-----------------|----------|--------|
+| 282 (skip MR) | 1,274ms | 4,958ms | GPU 3.9x faster |
+| 532 (all) | 23,647ms | 4,958ms | AADC 4.8x faster |
+
+The crossover point is ~300-400 params. Below that, GPU wins (fast re-integration for survival curves). Above that, AADC wins (O(1) vs O(N) for re-simulation bumps).
+
+**GPU 532-param breakdown:**
+- r0 + sigma (2 re-sims): ~0.5s
+- MR curve (250 re-sims): **22.9s** ← dominates
+- Survival curves (280 re-integrations): ~0.5s
+
 **Fair benchmark framing:**
 
 > "GPU brute-force bump-and-revalue vs CPU AADC demonstrates that algorithmic improvements (automatic differentiation) outweigh hardware acceleration. For GPU to win at risk computation, AD must be implemented on GPU—parallel finite differences are insufficient."

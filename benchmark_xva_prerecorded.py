@@ -249,6 +249,7 @@ def run_market_data_update_scenario(
     input_file: str,
     rate_bump_bp: float = 10.0,
     seed: int = 42,
+    skip_mr_bumps: bool = True,
 ) -> List[dict]:
     """
     Scenario 1: Market Data Update with Pre-Recorded Kernel
@@ -386,7 +387,7 @@ def run_market_data_update_scenario(
             sens_time, num_bumped = gpu_bump_and_revalue(
                 randoms, hw_bumped, grid, trades, csa, cumulat1_b, cumulat2_b,
                 company_surv, ctrparty_surv, cva, dva, num_pricing,
-                base_pee=pee, base_nee=nee, skip_mr_bumps=True)
+                base_pee=pee, base_nee=nee, skip_mr_bumps=skip_mr_bumps)
 
             total_time = primal_time + sens_time
             mem = memory_tracker.get_snapshot()
@@ -494,6 +495,7 @@ def run_new_trade_scenario(
     t0: int = 0,
     num_periods: int = 5,
     seed: int = 42,
+    skip_mr_bumps: bool = True,
 ) -> List[dict]:
     """
     Scenario 2: New Trade with Pre-Recorded Kernel (Incremental XVA)
@@ -661,7 +663,7 @@ def run_new_trade_scenario(
             sens_time, num_bumped = gpu_bump_and_revalue(
                 randoms, hw, grid, trades_new, csa, cumulat1, cumulat2,
                 company_surv, ctrparty_surv, cva_new, dva_new, num_pricing,
-                base_pee=pee_new, base_nee=nee_new, skip_mr_bumps=True)
+                base_pee=pee_new, base_nee=nee_new, skip_mr_bumps=skip_mr_bumps)
 
             # Calculate incremental XVA
             delta_cva = cva_new - cva_base
@@ -821,6 +823,8 @@ Examples:
                         help='Random seed (default: 42)')
     parser.add_argument('--no-log', action='store_true',
                         help='Skip CSV logging')
+    parser.add_argument('--include-mr-bumps', action='store_true',
+                        help='Include mean reversion curve bumps for GPU (adds ~250 params)')
 
     args = parser.parse_args()
 
@@ -868,6 +872,7 @@ Examples:
             input_file=args.input,
             rate_bump_bp=args.rate_bump,
             seed=args.seed,
+            skip_mr_bumps=not args.include_mr_bumps,
         )
         all_log_rows.extend(rows)
 
@@ -881,6 +886,7 @@ Examples:
             t0=t0_days,
             num_periods=num_periods,
             seed=args.seed,
+            skip_mr_bumps=not args.include_mr_bumps,
         )
         all_log_rows.extend(rows)
 
