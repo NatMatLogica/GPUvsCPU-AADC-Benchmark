@@ -1215,7 +1215,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Modular XVA Benchmark')
     parser.add_argument('--num-trades', '-t', type=int, default=100)
     parser.add_argument('--num-trade-types', type=int, default=5)
-    parser.add_argument('--mc-paths', '-m', type=int, default=51200)
+    parser.add_argument('--mc-paths', '-m', type=int, default=10000)
     parser.add_argument('--scenario', choices=['all', 'full', 'market_update', 'new_trade', 'sensitivities'],
                         default='all')
 

@@ -39,7 +39,7 @@
     },
     "ModelAndPricingTimes": {
         "T": 10950,
-        "step": 20,
+        "step": 30,
         "PricingFreq": 3
     },
     "Portfolio": {
@@ -54,7 +54,7 @@
         "c_t": 0
     },
     "t0": 0,
-    "MCPaths": 102400,
+    "MCPaths": 10000,
     "UseMCPathBoundForPrimal": true,
     "MCPathsBoundForPrimal": 1024,
     "Forward Only": false,

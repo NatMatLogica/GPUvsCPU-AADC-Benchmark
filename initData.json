@@ -38,8 +38,8 @@
         "flat_rate": 0.011
     },
     "ModelAndPricingTimes": {
-        "T": 14300,
-        "step": 50,
+        "T": 10950,
+        "step": 30,
         "PricingFreq": 3
     },
     "Portfolio": {
@@ -55,7 +55,7 @@
             
     },
     "t0": 0,
-    "MCPaths": 16,
+    "MCPaths": 10000,
     "UseMCPathBoundForPrimal" : true,
     "MCPathsBoundForPrimal" : 16,
     "Forward Only" : false,

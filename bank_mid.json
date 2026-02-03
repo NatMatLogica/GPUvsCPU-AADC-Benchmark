@@ -54,7 +54,7 @@
         "c_t": 0
     },
     "t0": 0,
-    "MCPaths": 51200,
+    "MCPaths": 10000,
     "UseMCPathBoundForPrimal": true,
     "MCPathsBoundForPrimal": 1024,
     "Forward Only": false,

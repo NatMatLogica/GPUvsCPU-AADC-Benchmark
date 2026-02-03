@@ -599,7 +599,7 @@ def log_result(scenario: str, num_trades: int, num_paths: int,
 # Main Benchmark
 # =============================================================================
 
-def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
+def run_benchmark(num_trades: int = 100, num_paths: int = 10000,
                   num_threads: int = 4, scenario: str = 'all'):
     """Run AADC modular XVA benchmark."""
 
@@ -793,7 +793,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='AADC Modular XVA Benchmark')
     parser.add_argument('--num-trades', '-t', type=int, default=100)
-    parser.add_argument('--mc-paths', '-m', type=int, default=1000)
+    parser.add_argument('--mc-paths', '-m', type=int, default=10000)
     parser.add_argument('--threads', type=int, default=4,
                         help='Number of AADC threads (default: 4)')
     parser.add_argument('--scenario', choices=['all', 'full', 'market_update', 'new_trade', 'sensitivities'],

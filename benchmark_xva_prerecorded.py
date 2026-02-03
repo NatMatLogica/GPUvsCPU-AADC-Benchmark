@@ -784,7 +784,7 @@ Examples:
     )
     parser.add_argument('--input', '-i', type=str, default=DEFAULT_INPUT,
                         help='Path to initData.json')
-    parser.add_argument('--mc-paths', '-m', type=int, default=51200,
+    parser.add_argument('--mc-paths', '-m', type=int, default=10000,
                         help='Number of Monte Carlo paths (default: 51200)')
     parser.add_argument('--num-trades', '-t', type=int, default=100,
                         help='Number of trades in base portfolio (default: 100)')
