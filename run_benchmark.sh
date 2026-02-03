@@ -5,10 +5,15 @@
 # Results are logged to data/execution_log_xva.csv
 #
 # Usage:
-#   ./run_benchmark.sh                      # run all configs (8 threads)
-#   ./run_benchmark.sh small                # run one config
+#   ./run_benchmark.sh                      # run small/medium/large (16 threads)
+#   ./run_benchmark.sh micro                # run micro config (5 trades, 16 paths)
+#   ./run_benchmark.sh small 8              # run one config with 8 threads
 #   ./run_benchmark.sh small medium         # run selected configs
-#   THREADS=16 ./run_benchmark.sh medium    # override thread count
+#   ./run_benchmark.sh small medium 4       # run selected configs with 4 threads
+#   THREADS=8 ./run_benchmark.sh medium     # override thread count via env
+#
+# Configs: micro (5 trades, 10K paths), small (50 trades, 16K paths),
+#          medium (200 trades, 32K paths), large (500 trades, 64K paths)
 
 set -euo pipefail
 
@@ -27,20 +32,32 @@ else
 fi
 
 AADC_BINARY="./build/xva_server"
-THREADS="${THREADS:-8}"
+THREADS="${THREADS:-16}"
 
 # Config definitions: name json_file mc_paths aadc_threads
 declare -A CONFIGS
+CONFIGS[micro]="bank_micro.json"
 CONFIGS[small]="bank_small.json"
 CONFIGS[medium]="bank_medium.json"
 CONFIGS[large]="bank_large.json"
 
 # Select configs to run
-if [[ $# -gt 0 ]]; then
-    SELECTED=("$@")
-else
+# If last argument is a number, use it as thread count
+SELECTED=()
+for arg in "$@"; do
+    if [[ "$arg" =~ ^[0-9]+$ ]]; then
+        THREADS="$arg"
+    else
+        SELECTED+=("$arg")
+    fi
+done
+
+# Default to all configs if none specified (excluding micro)
+if [[ ${#SELECTED[@]} -eq 0 ]]; then
     SELECTED=(small medium large)
 fi
+
+echo "Threads: $THREADS"
 
 separator() {
     echo ""
@@ -71,14 +88,14 @@ run_aadc() {
 }
 
 # ------------------------------------------------------------------
-# Run GPU brute-force
+# Run GPU backends (brute-force + pathwise)
 # ------------------------------------------------------------------
 run_gpu() {
     local config_file="$1"
 
-    echo "  GPU Brute-Force: $config_file (MC paths from JSON)"
-    echo "  Command: python benchmark_xva.py --input-file $config_file --backends gpu --mode pricing_with_greeks"
-    python benchmark_xva.py --input-file "$config_file" --backends gpu --mode pricing_with_greeks
+    echo "  GPU Backends: $config_file (brute-force + pathwise)"
+    echo "  Command: python benchmark_xva.py --input-file $config_file --backends gpu pathwise --mode pricing_with_greeks --threads $THREADS"
+    python benchmark_xva.py --input-file "$config_file" --backends gpu pathwise --mode pricing_with_greeks --threads "$THREADS"
     echo ""
 }
 
@@ -94,7 +111,7 @@ echo ""
 for cfg in "${SELECTED[@]}"; do
     config_file="${CONFIGS[$cfg]:-}"
     if [[ -z "$config_file" ]]; then
-        echo "Unknown config: $cfg (available: small medium large)"
+        echo "Unknown config: $cfg (available: micro small medium large)"
         continue
     fi
     if [[ ! -f "$config_file" ]]; then

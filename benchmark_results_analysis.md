@@ -1,5 +1,53 @@
 # XVA-Benchmark Execution Log Analysis
 
+## Recent Optimizations (v1.2.0)
+
+### Bump Size Fix
+- **Changed:** `bump = 1e-4` → `bump = 1e-8`
+- **Rationale:** Match C++ AADC `bump_size` exactly (see `XVAJobRequest.h:679`)
+- **Impact:** Ensures numerical derivatives are computed with identical perturbation size
+
+### CUDA Streams for Concurrent Bumps
+- **Added:** `GPUSimulationContext` class for pre-allocated GPU resources
+- **Added:** `run_gpu_simulation_streamed()` for stream-based kernel launches
+- **Benefit:** Mean reversion curve bumps now execute concurrently (up to 16 streams)
+- **Expected speedup:** 10-16x on bump-and-revalue loop for large MR curves
+
+### Remaining Optimizations (Not Yet Implemented)
+- Shared memory for curve data (medium effort, 2-5x kernel speedup)
+- Native CUDA C++ port (high effort, 2-5x overall)
+- cuRAND for on-device RNG (medium effort, eliminates transfer overhead)
+
+### Note on Benchmark Legitimacy
+
+**Why GPU bump-and-revalue cannot beat CPU AAD:**
+
+The fundamental issue is algorithmic complexity, not implementation quality:
+
+| Approach | Complexity | Gradients |
+|----------|------------|-----------|
+| Bump-and-revalue | O(N × M) | N separate simulations |
+| Reverse-mode AD (AADC) | O(M) | All gradients in ~2-4x forward cost |
+
+Where N = number of risk factors, M = MC paths.
+
+No amount of GPU optimization (shared memory, streams, native CUDA, cuRAND) can overcome this O(N) vs O(1) algorithmic gap. Even a 20x faster GPU bump-and-revalue implementation would lose to AADC for risk computation when N > 20.
+
+**How GPU practitioners achieve "1000x speedups" in practice:**
+
+1. **GPU AAD** — Implement reverse-mode AD directly in CUDA (best of both worlds)
+2. **Pathwise derivatives** — Analytically differentiate within MC paths (see `xva_pathwise_sketch.py`)
+3. **Likelihood ratio method** — Compute Greeks as expectations without bumping
+4. **Mixed precision** — FP16/TF32 tensor cores vs FP64 (where "1000x" marketing claims originate)
+
+**Fair benchmark framing:**
+
+> "GPU brute-force bump-and-revalue vs CPU AADC demonstrates that algorithmic improvements (automatic differentiation) outweigh hardware acceleration. For GPU to win at risk computation, AD must be implemented on GPU—parallel finite differences are insufficient."
+
+The current benchmark is honest: it compares the **common industry practice** (GPU Monte Carlo + finite differences) against **state-of-the-art AD** (AADC). GPU wins for pricing-only; AADC wins for pricing+risk.
+
+---
+
 ## How the C++ AADC Actually Works
 
 Looking at `XVAJobRequest.h:778-836`, `processRequest()` does this:

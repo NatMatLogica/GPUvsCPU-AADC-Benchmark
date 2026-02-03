@@ -35,30 +35,30 @@
     "CounterPartySurvivalCurve": {
         "T": 10950,
         "step": 180,
-        "flat_rate": 0.012
+        "flat_rate": 0.008
     },
     "ModelAndPricingTimes": {
         "T": 10950,
-        "step": 20,
+        "step": 30,
         "PricingFreq": 3
     },
     "Portfolio": {
-        "NumRandomTrades": 200,
-        "NumPeriods": 30
+        "NumRandomTrades": 5,
+        "NumPeriods": 20
     },
     "csa": {
         "mta_h": 1.0,
         "mta_l": 1.0,
-        "th": 25.0,
-        "tl": -25.0,
+        "th": 10.0,
+        "tl": -10.0,
         "c_t": 0
     },
     "t0": 0,
-    "MCPaths": 32768,
+    "MCPaths": 10240,
     "UseMCPathBoundForPrimal": true,
     "MCPathsBoundForPrimal": 1024,
     "Forward Only": false,
-    "Primal Is Requred": false,
+    "Primal Is Requred": true,
     "Adept": false,
     "Primal and Bumps Are Required": false,
     "Selective bumps": false

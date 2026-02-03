@@ -248,7 +248,7 @@ def run_cpu_baseline(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
 def cpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
                          company_surv, ctrparty_surv, base_cva, base_dva):
     """Bump-and-revalue for all sensitivity parameters on CPU."""
-    bump = 1e-4
+    bump = 1e-8  # Match C++ AADC bump_size exactly
     t0 = time.perf_counter()
     num_bumped = 0
     num_paths = randoms.shape[0]
@@ -377,17 +377,45 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
 
     num_paths = randoms.shape[0]
     num_pricing = int(grid.is_pricing.sum())
+    num_trades = trades.num_trades
+    max_cf = trades.max_cf
 
     print(f"  GPU brute-force: {num_paths} paths, {len(grid.model_times)} steps, "
-          f"{num_pricing} pricing times, {trades.num_trades} trades")
+          f"{num_pricing} pricing times, {num_trades} trades")
+
+    # Calculate GPU memory usage
+    gpu_memory_bytes = (
+        # Input arrays
+        randoms.nbytes +
+        hw.mean_rev_times.nbytes + hw.mean_rev_vals.nbytes +
+        cumulat1.nbytes + cumulat2.nbytes +
+        hw.spread_3m_times.nbytes + hw.spread_3m_vals.nbytes +
+        hw.spread_6m_times.nbytes + hw.spread_6m_vals.nbytes +
+        hw.spread_12m_times.nbytes + hw.spread_12m_vals.nbytes +
+        grid.model_times.nbytes + grid.is_pricing.nbytes +
+        trades.fixed_amounts.nbytes + trades.fixed_times.nbytes + trades.fixed_num_cfs.nbytes +
+        trades.float_notionals.nbytes + trades.float_start_times.nbytes +
+        trades.float_end_times.nbytes + trades.float_pay_times.nbytes +
+        trades.float_spread_ids.nbytes + trades.float_num_cfs.nbytes +
+        # Per-path state arrays (float64=8, int32=4)
+        num_paths * num_trades * max_cf * 8 +  # d_fwd_cache
+        num_paths * num_trades * max_cf * 4 +  # d_fwd_set
+        num_paths * num_trades * 4 * 2 +       # d_fixed_first, d_float_first
+        # Output arrays
+        num_paths * num_pricing * 8 * 2        # pee, nee
+    )
+    gpu_memory_mb = gpu_memory_bytes / (1024 * 1024)
 
     # Warm up CUDA JIT
+    jit_warmup_time = 0.0
     if num_paths > 1:
         print("  Warming up CUDA JIT...")
+        t_jit_start = time.perf_counter()
         warmup_randoms = randoms[:1].copy()
         _ = run_gpu_simulation(warmup_randoms, hw, grid, trades, csa,
                                cumulat1, cumulat2, num_pricing)
-        print("  JIT warm-up done.")
+        jit_warmup_time = time.perf_counter() - t_jit_start
+        print(f"  JIT warm-up done: {jit_warmup_time:.3f}s")
 
     # Primal
     t0 = time.perf_counter()
@@ -412,18 +440,20 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
             base_pee=pee_gpu, base_nee=nee_gpu)
 
     total_time = primal_time + sens_time
-    print(f"  GPU done: CVA={cva:.10f}, DVA={dva:.10f}, "
-          f"primal={primal_time:.2f}s, kernel={gpu_kernel_time:.2f}s, "
-          f"sens={sens_time:.2f}s, total={total_time:.2f}s")
+    print(f"  GPU done: CVA={cva:.10f}, DVA={dva:.10f}")
+    print(f"    JIT={jit_warmup_time:.3f}s, kernel={gpu_kernel_time:.2f}s, "
+          f"sens={sens_time:.2f}s, total={total_time:.2f}s, mem={gpu_memory_mb:.1f}MB")
 
     return XVAResult(
         backend="gpu_brute_force", mode=mode,
         cva=cva, dva=dva,
-        primal_time_sec=primal_time,
+        primal_time_sec=gpu_kernel_time,        # Kernel execution time (reusable)
         sensitivity_time_sec=sens_time,
         total_time_sec=total_time,
+        kernel_recording_sec=jit_warmup_time,   # JIT compilation
         gpu_kernel_time_sec=gpu_kernel_time,
         num_params_bumped=num_bumped,
+        gpu_memory_mb=gpu_memory_mb,
         pee=pee_gpu, nee=nee_gpu,
     )
 
@@ -438,10 +468,12 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
       - Mean reversion curve points (require full MC re-simulation)
       - Company survival curve points (re-integration only, no re-simulation)
       - Counterparty survival curve points (re-integration only, no re-simulation)
-    """
-    from xva_gpu_kernel import run_gpu_simulation, compute_cva_dva
 
-    bump = 1e-4
+    Uses CUDA streams for concurrent execution of independent bump scenarios.
+    """
+    from xva_gpu_kernel import run_gpu_simulation, run_gpu_simulation_streamed, compute_cva_dva
+
+    bump = 1e-8  # Match C++ AADC bump_size exactly
     t0 = time.perf_counter()
     num_resim = 0   # bumps requiring full GPU re-simulation
     num_reint = 0   # bumps requiring only re-integration (CPU-side)
@@ -510,25 +542,51 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
     print(f"    sigma: dCVA/dsigma = {(cva_b2 - base_cva) / bump:.6f}")
 
     # Bump mean reversion curve points (requires full re-simulation)
+    # Use CUDA streams for concurrent execution
     n_mr = len(hw.mean_rev_vals)
-    print(f"    Bumping {n_mr} mean reversion points on GPU...")
-    for i in range(n_mr):
-        mr_bumped = hw.mean_rev_vals.copy()
-        mr_bumped[i] += bump
-        cum1_b, cum2_b = precompute_cumulatives(hw.mean_rev_times, mr_bumped, hw.alpha)
-        hw_bi = HWModelParams(
-            alpha=hw.alpha, sigma=hw.sigma, r0=hw.r0,
-            mean_rev_times=hw.mean_rev_times, mean_rev_vals=mr_bumped,
-            spread_3m_times=hw.spread_3m_times, spread_3m_vals=hw.spread_3m_vals,
-            spread_6m_times=hw.spread_6m_times, spread_6m_vals=hw.spread_6m_vals,
-            spread_12m_times=hw.spread_12m_times, spread_12m_vals=hw.spread_12m_vals,
-        )
-        run_gpu_simulation(randoms, hw_bi, grid, trades, csa,
-                           cum1_b, cum2_b, num_pricing)
-        num_resim += 1
-        if (i + 1) % 50 == 0:
+    print(f"    Bumping {n_mr} mean reversion points on GPU (streamed)...")
+
+    from xva_gpu_kernel import GPUSimulationContext, run_gpu_simulation_streamed, collect_streamed_results
+
+    # Determine optimal stream count based on GPU memory and MR points
+    # More streams = more concurrency, but each needs output buffers
+    num_streams = min(16, n_mr)  # Cap at 16 streams for memory efficiency
+
+    # Create GPU context with pre-allocated resources
+    ctx = GPUSimulationContext(
+        randoms, hw, grid, trades, csa, cumulat1, cumulat2,
+        num_pricing, num_streams=num_streams
+    )
+
+    # Process MR bumps in batches of num_streams
+    for batch_start in range(0, n_mr, num_streams):
+        batch_end = min(batch_start + num_streams, n_mr)
+        batch_size = batch_end - batch_start
+
+        # Launch all bumps in this batch concurrently
+        for i in range(batch_size):
+            mr_idx = batch_start + i
+            stream_idx = i
+
+            # Prepare bumped curve
+            mr_bumped = hw.mean_rev_vals.copy()
+            mr_bumped[mr_idx] += bump
+            cum1_b, cum2_b = precompute_cumulatives(hw.mean_rev_times, mr_bumped, hw.alpha)
+
+            # Launch on stream (non-blocking)
+            run_gpu_simulation_streamed(
+                ctx, hw.mean_rev_times, mr_bumped, cum1_b, cum2_b, stream_idx
+            )
+
+        # Wait for this batch to complete before starting next
+        ctx.synchronize_all()
+        num_resim += batch_size
+
+        if batch_end % 50 == 0 or batch_end == n_mr:
             elapsed = time.perf_counter() - t0
-            print(f"      MR point {i+1}/{n_mr} ({elapsed:.1f}s)")
+            print(f"      MR point {batch_end}/{n_mr} ({elapsed:.1f}s)")
+
+    ctx.close()
 
     # Bump counterparty survival curve points (re-integration only, no re-simulation)
     n_ctrp = len(ctrparty_surv.values)
@@ -642,27 +700,46 @@ def run_aadc_cpp(input_file, num_mc_paths, num_threads, mode="pricing_only"):
     with open(results_file) as f:
         res = json.load(f)
 
-    primal = res.get("Primal results", {})
-    cva = primal.get("CVA", 0.0)
-    dva = primal.get("DVA", 0.0)
+    # Get CVA/DVA from primal results (AADC computes derivatives, not values)
+    # JSON key is "primal" not "Primal results"
+    primal = res.get("primal", res.get("Primal results", {}))
+    final_cva = primal.get("CVA", 0.0)
+    final_dva = primal.get("DVA", 0.0)
 
+    # Get primal time from JSON (in microseconds)
     if primal_time == 0.0:
-        primal_time = primal.get("Computation_time_ms", 0.0) / 1000.0
+        primal_time_us = res.get("primal time", 0.0)
+        if primal_time_us > 0:
+            primal_time = primal_time_us / 1e6  # Convert us to seconds
 
-    aadc_res = res.get("AADC results", {})
-    aadc_cva = aadc_res.get("CVA", cva)
-    aadc_dva = aadc_res.get("DVA", dva)
+    # If primal CVA/DVA not available, try AADC results (may be non-zero if computed there)
+    if final_cva == 0.0 and final_dva == 0.0:
+        aadc_res = res.get("AADC results", {})
+        aadc_cva = aadc_res.get("CVA", 0.0)
+        aadc_dva = aadc_res.get("DVA", 0.0)
+        if aadc_cva != 0.0 or aadc_dva != 0.0:
+            final_cva = aadc_cva
+            final_dva = aadc_dva
 
-    # Use AADC values if non-zero, otherwise primal
-    final_cva = aadc_cva if aadc_cva != 0.0 else cva
-    final_dva = aadc_dva if aadc_dva != 0.0 else dva
+    # Get compiler/memory info if available
+    compiler_data = res.get("compiler data", {})
+    code_size_fwd = compiler_data.get("Code size forward", 0)
+    code_size_rev = compiler_data.get("Code size reverse", 0)
+    aadc_memory_mb = (code_size_fwd + code_size_rev) / (1024 * 1024)  # Kernel code size
+
+    # Get kernel recording/compilation time from compiler data (in microseconds)
+    if kernel_recording == 0.0:
+        compilation_us = compiler_data.get("Compilation time", 0)
+        if compilation_us > 0:
+            kernel_recording = compilation_us / 1e6  # Convert us to seconds
 
     sens_time = total_time - primal_time - kernel_recording
     if sens_time < 0:
         sens_time = 0.0
 
-    print(f"  AADC done: CVA={final_cva:.10f}, DVA={final_dva:.10f}, "
-          f"primal={primal_time:.2f}s, recording={kernel_recording:.2f}s, total={total_time:.2f}s")
+    print(f"  AADC done: CVA={final_cva:.10f}, DVA={final_dva:.10f}")
+    print(f"    recording={kernel_recording:.2f}s, eval={primal_time:.2f}s, "
+          f"total={total_time:.2f}s, kernel={aadc_memory_mb:.1f}MB")
 
     return XVAResult(
         backend="aadc_cpu", mode=mode,
@@ -671,6 +748,7 @@ def run_aadc_cpp(input_file, num_mc_paths, num_threads, mode="pricing_only"):
         sensitivity_time_sec=sens_time,
         total_time_sec=total_time,
         kernel_recording_sec=kernel_recording,
+        gpu_memory_mb=aadc_memory_mb,  # AADC kernel code size (for comparison)
     )
 
 
@@ -747,12 +825,12 @@ def main():
                         help="Number of MC paths (default: from JSON MCPaths)")
     parser.add_argument("--trades", type=int, default=None,
                         help="Override number of trades (default: from JSON)")
-    parser.add_argument("--threads", type=int, default=1,
-                        help="CPU threads for AADC (default: 1)")
+    parser.add_argument("--threads", type=int, default=16,
+                        help="CPU threads for AADC (default: 16)")
     parser.add_argument("--backends", nargs="+", default=["cpu", "gpu", "aadc"],
-                        choices=["cpu", "gpu", "aadc"],
+                        choices=["cpu", "gpu", "aadc", "pathwise"],
                         help="Backends to run (default: cpu gpu aadc)")
-    parser.add_argument("--mode", default="pricing_only",
+    parser.add_argument("--mode", default="pricing_with_greeks",
                         choices=["pricing_only", "pricing_with_greeks"],
                         help="Calculation mode")
     parser.add_argument("--input-file", default=DEFAULT_INPUT,
@@ -851,6 +929,20 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
                                     args.threads, mode=args.mode)
         if aadc_result:
             results.append(aadc_result)
+
+    if "pathwise" in args.backends:
+        print(f"\n--- Pathwise GPU ---")
+        try:
+            from xva_pathwise_gpu import run_pathwise_gpu
+            pathwise_result = run_pathwise_gpu(
+                randoms, hw, grid, trades, csa, cumulat1, cumulat2,
+                company_surv, ctrparty_surv, mode=args.mode)
+            if pathwise_result:
+                results.append(pathwise_result)
+        except Exception as e:
+            print(f"  Pathwise GPU failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     if results:
         print_results(results, ref_cva, ref_dva, num_paths,

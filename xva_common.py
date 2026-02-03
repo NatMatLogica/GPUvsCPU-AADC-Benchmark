@@ -85,12 +85,13 @@ class XVAResult:
     mode: str
     cva: float
     dva: float
-    primal_time_sec: float = 0.0
-    sensitivity_time_sec: float = 0.0
-    total_time_sec: float = 0.0
-    kernel_recording_sec: float = 0.0
-    gpu_kernel_time_sec: float = 0.0
+    primal_time_sec: float = 0.0       # Kernel execution time (reusable, excludes recording)
+    sensitivity_time_sec: float = 0.0   # Separate sensitivity phase (bump-and-revalue only)
+    total_time_sec: float = 0.0         # Wall clock total (transfers + kernel + reduction)
+    kernel_recording_sec: float = 0.0   # One-time JIT/compilation cost
+    gpu_kernel_time_sec: float = 0.0    # GPU kernel time (may equal primal for GPU backends)
     num_params_bumped: int = 0
+    gpu_memory_mb: float = 0.0          # GPU device memory allocated
     pee: Optional[np.ndarray] = None
     nee: Optional[np.ndarray] = None
     sensitivities: Optional[Dict] = None
@@ -554,5 +555,6 @@ def build_log_row(result: XVAResult, grid: SimulationGrid,
         "max_cva_diff": abs(result.cva - ref_cva) if ref_cva is not None else "",
         "max_dva_diff": abs(result.dva - ref_dva) if ref_dva is not None else "",
         "gpu_kernel_time_sec": result.gpu_kernel_time_sec,
+        "gpu_memory_mb": result.gpu_memory_mb,
         "status": "success",
     }

@@ -6,10 +6,11 @@ Ports the C++ XVA-Benchmark simulation to GPU:
   - CVA/DVA computed on CPU from averaged exposures
 
 Supports arbitrary portfolio sizes via device global memory for per-path state.
+Uses CUDA streams for concurrent execution of independent bump scenarios.
 
-Version: 1.1.0
+Version: 1.2.0
 """
-MODEL_VERSION = "1.1.0"
+MODEL_VERSION = "1.2.0"
 
 import numpy as np
 import math
@@ -430,3 +431,185 @@ def run_gpu_simulation(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
         offset += batch_n
 
     return all_pee, all_nee
+
+
+# ---------------------------------------------------------------------------
+# Streamed Simulation for Concurrent Bump-and-Revalue
+# ---------------------------------------------------------------------------
+
+class GPUSimulationContext:
+    """Pre-allocated GPU resources for streamed bump-and-revalue.
+
+    Holds device arrays and streams to enable concurrent execution of
+    independent bump scenarios without repeated allocation overhead.
+    """
+
+    def __init__(self, randoms, hw, grid, trades, csa, cumulat1, cumulat2,
+                 num_pricing_times, num_streams=8, block_size=256):
+        """Initialize GPU context with shared data and stream pool.
+
+        Args:
+            randoms: Pre-generated random numbers (num_paths, num_steps)
+            hw: HullWhite model parameters
+            grid: Simulation grid
+            trades: Trade data
+            csa: CSA parameters
+            cumulat1, cumulat2: Precomputed HW cumulatives
+            num_pricing_times: Number of pricing time points
+            num_streams: Number of CUDA streams for concurrent execution
+            block_size: CUDA block size
+        """
+        self.num_paths = randoms.shape[0]
+        self.num_steps = randoms.shape[1]
+        self.num_trades = trades.num_trades
+        self.max_cf = trades.max_cf
+        self.num_pricing_times = num_pricing_times
+        self.block_size = block_size
+        self.num_streams = num_streams
+
+        # Create stream pool
+        self.streams = [cuda.stream() for _ in range(num_streams)]
+
+        # Transfer constant data to device (shared across all bumps)
+        self.d_randoms = cuda.to_device(randoms)
+        self.d_model_times = cuda.to_device(grid.model_times)
+        self.d_is_pricing = cuda.to_device(grid.is_pricing.astype(np.int32))
+
+        # Trade data (constant)
+        self.d_fixed_amounts = cuda.to_device(trades.fixed_amounts)
+        self.d_fixed_times = cuda.to_device(trades.fixed_times)
+        self.d_fixed_num_cfs = cuda.to_device(trades.fixed_num_cfs)
+        self.d_float_notionals = cuda.to_device(trades.float_notionals)
+        self.d_float_start = cuda.to_device(trades.float_start_times)
+        self.d_float_end = cuda.to_device(trades.float_end_times)
+        self.d_float_pay = cuda.to_device(trades.float_pay_times)
+        self.d_float_spread = cuda.to_device(trades.float_spread_ids)
+        self.d_float_num_cfs = cuda.to_device(trades.float_num_cfs)
+
+        # Spread curves (constant across all bumps)
+        self.d_sp0_times = cuda.to_device(hw.spread_3m_times)
+        self.d_sp0_vals = cuda.to_device(hw.spread_3m_vals)
+        self.d_sp1_times = cuda.to_device(hw.spread_6m_times)
+        self.d_sp1_vals = cuda.to_device(hw.spread_6m_vals)
+        self.d_sp2_times = cuda.to_device(hw.spread_12m_times)
+        self.d_sp2_vals = cuda.to_device(hw.spread_12m_vals)
+        self.n_sp0 = len(hw.spread_3m_times)
+        self.n_sp1 = len(hw.spread_6m_times)
+        self.n_sp2 = len(hw.spread_12m_times)
+
+        # Store scalar parameters
+        self.alpha = hw.alpha
+        self.sigma = hw.sigma
+        self.r0 = hw.r0
+        self.csa_th = csa.th
+        self.csa_tl = csa.tl
+        self.csa_mta_h = csa.mta_h
+        self.csa_mta_l = csa.mta_l
+        self.csa_c_t = csa.c_t
+
+        # Per-stream working arrays for per-path state
+        self.d_fwd_cache = [
+            cuda.device_array((self.num_paths, self.num_trades, self.max_cf), dtype=np.float64)
+            for _ in range(num_streams)
+        ]
+        self.d_fwd_set = [
+            cuda.device_array((self.num_paths, self.num_trades, self.max_cf), dtype=np.int32)
+            for _ in range(num_streams)
+        ]
+        self.d_fixed_first = [
+            cuda.device_array((self.num_paths, self.num_trades), dtype=np.int32)
+            for _ in range(num_streams)
+        ]
+        self.d_float_first = [
+            cuda.device_array((self.num_paths, self.num_trades), dtype=np.int32)
+            for _ in range(num_streams)
+        ]
+
+        # Per-stream output arrays
+        self.d_out_pee = [
+            cuda.device_array((self.num_paths, num_pricing_times), dtype=np.float64)
+            for _ in range(num_streams)
+        ]
+        self.d_out_nee = [
+            cuda.device_array((self.num_paths, num_pricing_times), dtype=np.float64)
+            for _ in range(num_streams)
+        ]
+
+        # Compute grid dimensions
+        self.blocks = (self.num_paths + block_size - 1) // block_size
+
+    def synchronize_all(self):
+        """Wait for all streams to complete."""
+        for stream in self.streams:
+            stream.synchronize()
+
+    def close(self):
+        """Clean up streams."""
+        self.synchronize_all()
+
+
+def run_gpu_simulation_streamed(ctx, mr_times, mr_vals, cumulat1, cumulat2,
+                                 stream_idx, alpha=None, sigma=None, r0=None):
+    """Launch simulation kernel on a specific stream.
+
+    Args:
+        ctx: GPUSimulationContext with pre-allocated resources
+        mr_times: Mean reversion curve times (can be bumped)
+        mr_vals: Mean reversion curve values (can be bumped)
+        cumulat1, cumulat2: Precomputed cumulatives for bumped curve
+        stream_idx: Which stream to use (0 to num_streams-1)
+        alpha, sigma, r0: Optional scalar overrides (for bumping)
+
+    Returns:
+        stream_idx for tracking which stream was used
+    """
+    stream = ctx.streams[stream_idx]
+
+    # Use overrides or defaults
+    alpha = alpha if alpha is not None else ctx.alpha
+    sigma = sigma if sigma is not None else ctx.sigma
+    r0 = r0 if r0 is not None else ctx.r0
+
+    # Transfer bumped curve data to device (async)
+    d_mr_times = cuda.to_device(mr_times, stream=stream)
+    d_mr_vals = cuda.to_device(mr_vals, stream=stream)
+    d_cumulat1 = cuda.to_device(cumulat1, stream=stream)
+    d_cumulat2 = cuda.to_device(cumulat2, stream=stream)
+
+    # Launch kernel on this stream
+    simulate_xva_kernel[ctx.blocks, ctx.block_size, stream](
+        ctx.d_randoms,
+        alpha, sigma, r0,
+        d_mr_times, d_mr_vals, len(mr_times),
+        d_cumulat1, d_cumulat2,
+        ctx.d_sp0_times, ctx.d_sp0_vals, ctx.n_sp0,
+        ctx.d_sp1_times, ctx.d_sp1_vals, ctx.n_sp1,
+        ctx.d_sp2_times, ctx.d_sp2_vals, ctx.n_sp2,
+        ctx.d_model_times, ctx.d_is_pricing, ctx.num_steps,
+        ctx.d_fixed_amounts, ctx.d_fixed_times, ctx.d_fixed_num_cfs,
+        ctx.d_float_notionals, ctx.d_float_start, ctx.d_float_end,
+        ctx.d_float_pay, ctx.d_float_spread, ctx.d_float_num_cfs,
+        ctx.num_trades, ctx.max_cf,
+        ctx.csa_th, ctx.csa_tl, ctx.csa_mta_h, ctx.csa_mta_l, ctx.csa_c_t,
+        ctx.d_fwd_cache[stream_idx], ctx.d_fwd_set[stream_idx],
+        ctx.d_fixed_first[stream_idx], ctx.d_float_first[stream_idx],
+        ctx.d_out_pee[stream_idx], ctx.d_out_nee[stream_idx],
+    )
+
+    return stream_idx
+
+
+def collect_streamed_results(ctx, stream_idx):
+    """Collect results from a completed stream.
+
+    Args:
+        ctx: GPUSimulationContext
+        stream_idx: Which stream to collect from
+
+    Returns:
+        (pee, nee) arrays copied from device
+    """
+    ctx.streams[stream_idx].synchronize()
+    pee = ctx.d_out_pee[stream_idx].copy_to_host()
+    nee = ctx.d_out_nee[stream_idx].copy_to_host()
+    return pee, nee

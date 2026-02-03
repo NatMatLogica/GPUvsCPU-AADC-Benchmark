@@ -1,7 +1,7 @@
 {
     "Currencies": {
-        "EUR" : {
-            "Model" : "HullWhite",
+        "EUR": {
+            "Model": "HullWhite",
             "HWMeanReversionCurve": {
                 "T": 30,
                 "step": 0.25,
@@ -54,12 +54,12 @@
         "c_t": 0
     },
     "t0": 0,
-    "MCPaths": 4096,
-    "UseMCPathBoundForPrimal" : true,
-    "MCPathsBoundForPrimal" : 512,
-    "Forward Only" : false,
-    "Primal Is Requred" : false,
-    "Adept" : false,
-    "Primal and Bumps Are Required" : false,
-    "Selective bumps" : true
+    "MCPaths": 16384,
+    "UseMCPathBoundForPrimal": true,
+    "MCPathsBoundForPrimal": 1024,
+    "Forward Only": false,
+    "Primal Is Requred": false,
+    "Adept": false,
+    "Primal and Bumps Are Required": false,
+    "Selective bumps": false
 }
