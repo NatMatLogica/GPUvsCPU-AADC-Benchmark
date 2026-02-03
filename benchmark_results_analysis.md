@@ -100,7 +100,9 @@ The **0.70%** relative performance means ~**142x speedup** - AADC scales better 
 
 ## What the 50-Trade Execution Log Rows Actually Show
 
-The log rows showing `primal_time_sec` of 59-70s for `xva_cpp_aadc` are **mislabeled** in the CSV logging code. Looking at `XVAServer.cpp:254-256`:
+> **Note**: The column has been renamed from `primal_time_sec` to `eval_time_sec` to clarify the semantics.
+
+The log rows showing `eval_time_sec` of 59-70s for `xva_cpp_aadc` represent the **AADC evaluation time** (not a separate primal computation). Looking at `XVAServer.cpp:254-256`:
 
 ```cpp
 double primal_time_sec = obj->m_primal_is_required
@@ -114,9 +116,9 @@ log_xva_csv(..., "xva_cpp_aadc", ...,
     aadc_time_sec, 0.0, aadc_time_sec + compilation_sec, ...);
 ```
 
-So for the AADC row, `primal_time_sec` in the CSV is actually `m_aad_time` (the AADC evaluation time). The 50-trade rows show:
+So for the AADC row, `eval_time_sec` in the CSV is `m_aad_time` (the AADC evaluation time). The 50-trade rows show:
 
-| Run | AADC eval (logged as "primal") | Compilation | Total |
+| Run | AADC eval_time_sec | Compilation | Total |
 |-----|------|-------------|-------|
 | 1 | 69.8s | 7.4s | 77.2s |
 | 2 | 66.7s | 5.9s | 72.6s |

@@ -232,12 +232,12 @@ def run_cpu_baseline(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
 
     total_time = primal_time + sens_time
     print(f"  CPU done: CVA={cva:.10f}, DVA={dva:.10f}, "
-          f"primal={primal_time:.2f}s, sens={sens_time:.2f}s, total={total_time:.2f}s")
+          f"eval={primal_time:.2f}s, sens={sens_time:.2f}s, total={total_time:.2f}s")
 
     return XVAResult(
         backend="cpu_baseline", mode=mode,
         cva=cva, dva=dva,
-        primal_time_sec=primal_time,
+        eval_time_sec=primal_time,
         sensitivity_time_sec=sens_time,
         total_time_sec=total_time,
         num_params_bumped=num_bumped,
@@ -447,7 +447,7 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
     return XVAResult(
         backend="gpu_brute_force", mode=mode,
         cva=cva, dva=dva,
-        primal_time_sec=gpu_kernel_time,        # Kernel execution time (reusable)
+        eval_time_sec=gpu_kernel_time,        # Kernel execution time (reusable)
         sensitivity_time_sec=sens_time,
         total_time_sec=total_time,
         kernel_recording_sec=jit_warmup_time,   # JIT compilation
@@ -744,7 +744,7 @@ def run_aadc_cpp(input_file, num_mc_paths, num_threads, mode="pricing_only"):
     return XVAResult(
         backend="aadc_cpu", mode=mode,
         cva=final_cva, dva=final_dva,
-        primal_time_sec=primal_time,
+        eval_time_sec=primal_time,
         sensitivity_time_sec=sens_time,
         total_time_sec=total_time,
         kernel_recording_sec=kernel_recording,
@@ -791,14 +791,14 @@ def print_results(results, ref_cva, ref_dva, num_paths, num_trades,
             cpu_time = r.total_time_sec
             break
 
-    print(f"{'Backend':<22} {'Primal':>10} {'Sens':>10} {'Total':>10} {'Speedup':>10}")
+    print(f"{'Backend':<22} {'Eval':>10} {'Sens':>10} {'Total':>10} {'Speedup':>10}")
     print("-" * 62)
     for r in results:
         speedup = cpu_time / r.total_time_sec if r.total_time_sec > 0 and cpu_time > 0 else 0.0
         speedup_str = f"{speedup:.1f}x" if speedup > 0 else "N/A"
         if r.backend == "cpu_baseline":
             speedup_str = "1.0x"
-        print(f"{r.backend:<22} {r.primal_time_sec:>9.2f}s {r.sensitivity_time_sec:>9.2f}s "
+        print(f"{r.backend:<22} {r.eval_time_sec:>9.2f}s {r.sensitivity_time_sec:>9.2f}s "
               f"{r.total_time_sec:>9.2f}s {speedup_str:>10}")
 
     print()

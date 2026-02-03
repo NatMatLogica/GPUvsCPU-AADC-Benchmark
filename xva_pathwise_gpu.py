@@ -793,7 +793,7 @@ def run_pathwise_gpu(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
         mode=mode,
         cva=cva,
         dva=dva,
-        primal_time_sec=kernel_time,            # Kernel execution time (reusable)
+        eval_time_sec=kernel_time,              # Kernel execution time (reusable)
         sensitivity_time_sec=0.0,               # Greeks computed in same kernel pass
         total_time_sec=total_time,              # Full wall clock (transfer + kernel + reduction)
         kernel_recording_sec=jit_warmup_time,   # JIT compilation (like AADC kernel recording)

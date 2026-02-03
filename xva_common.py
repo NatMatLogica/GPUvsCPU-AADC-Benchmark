@@ -85,7 +85,7 @@ class XVAResult:
     mode: str
     cva: float
     dva: float
-    primal_time_sec: float = 0.0       # Kernel execution time (reusable, excludes recording)
+    eval_time_sec: float = 0.0       # Kernel execution time (reusable, excludes recording)
     sensitivity_time_sec: float = 0.0   # Separate sensitivity phase (bump-and-revalue only)
     total_time_sec: float = 0.0         # Wall clock total (transfers + kernel + reduction)
     kernel_recording_sec: float = 0.0   # One-time JIT/compilation cost
@@ -505,7 +505,7 @@ LOG_COLUMNS = [
     "num_sensitivity_params", "num_threads",
     "backend", "mode",
     "cva_result", "dva_result",
-    "primal_time_sec", "sensitivity_time_sec", "total_time_sec",
+    "eval_time_sec", "sensitivity_time_sec", "total_time_sec",
     "kernel_recording_sec", "num_params_bumped",
     "speedup_vs_cpu", "max_cva_diff", "max_dva_diff",
     "gpu_kernel_time_sec", "status",
@@ -546,7 +546,7 @@ def build_log_row(result: XVAResult, grid: SimulationGrid,
         "mode": result.mode,
         "cva_result": result.cva,
         "dva_result": result.dva,
-        "primal_time_sec": result.primal_time_sec,
+        "eval_time_sec": result.eval_time_sec,
         "sensitivity_time_sec": result.sensitivity_time_sec,
         "total_time_sec": result.total_time_sec,
         "kernel_recording_sec": result.kernel_recording_sec,

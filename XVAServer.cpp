@@ -48,7 +48,7 @@ static const char* CSV_HEADER =
     "timestamp,model_name,model_version,num_trades,num_mc_paths,"
     "num_model_steps,num_pricing_times,num_sensitivity_params,num_threads,"
     "backend,mode,cva_result,dva_result,"
-    "primal_time_sec,sensitivity_time_sec,total_time_sec,"
+    "eval_time_sec,sensitivity_time_sec,total_time_sec,"
     "kernel_recording_sec,num_params_bumped,speedup_vs_cpu,"
     "max_cva_diff,max_dva_diff,gpu_kernel_time_sec,status\n";
 
