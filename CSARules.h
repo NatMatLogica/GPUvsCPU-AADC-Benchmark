@@ -1,6 +1,6 @@
 #pragma once
 #include <aadc/ibool.h>
-#include "adept_local.h"
+// #include "adept_local.h"  // Adept removed - iIf provided by aadc/ibool.h
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 

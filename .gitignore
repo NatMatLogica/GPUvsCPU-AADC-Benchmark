@@ -1,0 +1,22 @@
+# Build outputs
+build/
+*.o
+*.out
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+
+# Local Claude settings
+.claude/
+
+# Temporary output files
+aad_out.json
+bump_out.json
+res_aad.json
+res_dbl.json

@@ -60,7 +60,7 @@
     "MCPathsBoundForPrimal" : 16,
     "Forward Only" : false,
     "Primal Is Requred" : true,
-    "Adept" : true,
+    "Adept" : false,
     "Primal and Bumps Are Required" : true,
     "Selective bumps" : true
 }

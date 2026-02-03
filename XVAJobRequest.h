@@ -218,7 +218,9 @@ public:
  
         m_forward_only=m_data["Forward Only"].template get<bool>();
         m_primal_is_required=m_data["Primal Is Requred"].template get<bool>();
+#ifdef HAS_ADEPT
         m_adept_is_required=m_data["Adept"].template get<bool>();
+#endif
         m_primal_and_bumps_are_required=m_data["Primal and Bumps Are Required"].template get<bool>();
         m_selective_bumps=m_data["Selective bumps"].template get<int>();
     }
@@ -235,7 +237,7 @@ public:
 
     void generateRandoms(int num_randoms_per_path) {
         m_randoms=std::vector<std::vector<double>>();
-        m_mm_randoms=std::vector<mmVector<mmType>>();
+        m_mm_randoms=std::vector<aadc::mmVector<mmType>>();
         std::mt19937_64 gen(17);
         std::normal_distribution<> normal_distrib(0, 1);
         for (int mc_i=0; mc_i<m_mc_iterations; mc_i++) {
@@ -258,18 +260,23 @@ public:
     void aADExecution(const json& request_data, int threads_num, std::atomic<bool>& cancel);    
     // bumpAndRevalue() implements computation of xVAs sensitivities using bump&revalue method
     void bumpAndRevalue(const json& request_data);
+#ifdef HAS_ADEPT
     //adept() implements computations of xVAs sensitivites using ADEPT AAD library
     void adept(const json& request_data);
+#endif
 
 public:
     json m_data;
     int m_mc_iterations, m_AVX_size, m_AVX_iterations, m_primal_mc_iterations; 
     double m_norm_coeff;
     bool m_primal_is_required, m_primal_and_bumps_are_required, m_selective_bumps
-        , m_forward_only, m_adept_is_required
+        , m_forward_only
     ;
+#ifdef HAS_ADEPT
+    bool m_adept_is_required;
+#endif
     std::vector<std::vector<double>> m_randoms;
-    std::vector<mmVector<mmType>> m_mm_randoms;
+    std::vector<aadc::mmVector<mmType>> m_mm_randoms;
  
     std::shared_ptr<std::vector<RequestFunction<mmType>>> m_func_request_cache;
 
@@ -281,7 +288,10 @@ public:
 
     json m_aad_results, m_all_results;
     json m_bump_risk_results, m_aad_risk_results; 
-    std::chrono::microseconds m_base_time, m_adept_base_time, m_aad_time;
+    std::chrono::microseconds m_base_time, m_aad_time;
+#ifdef HAS_ADEPT
+    std::chrono::microseconds m_adept_base_time;
+#endif
 };
 
 ////////////////////////////////////////////////////
@@ -419,9 +429,11 @@ void XVAJobRequest<mmType>::compileAADFunction(const json& request_data) {
         std::chrono::duration_cast<std::chrono::microseconds>(cmpl_stop - cmpl_start)
     ;
     std::cout << "\n------AAD-Compiler-------------\n";
-    std::cout << "Compilation time = " << cmpl_time.count()<< " microseconds\n";    
-    std::cout << "Compilation time / (Base time / Iterations) = " << cmpl_time.count() / 
-        (m_base_time.count()/m_primal_mc_iterations)<< " Base iteration times\n";   
+    std::cout << "Compilation time = " << cmpl_time.count()<< " microseconds\n";
+    if (m_base_time.count() > 0) {
+        std::cout << "Compilation time / (Base time / Iterations) = " << cmpl_time.count() /
+            (m_base_time.count()/m_primal_mc_iterations)<< " Base iteration times\n";
+    }
     
     std::cout << "Code size forward : " << m_aad_funcs->getCodeSizeFwd() << std::endl;
     std::cout << "Code size reverse : " << m_aad_funcs->getCodeSizeRev() << std::endl;
@@ -430,9 +442,11 @@ void XVAJobRequest<mmType>::compileAADFunction(const json& request_data) {
     std::cout << "Const data size   : " << m_aad_funcs->getConstDataSize() << std::endl;
     std::cout << "CheckPoint size   : " << m_aad_funcs->getNumCheckPointVars() << std::endl;
 
-    m_all_results["compiler data"]["Compilation time"]= cmpl_time.count();    
-    m_all_results["compiler data"]["Compilation time / (Base time / Iterations)"]=cmpl_time.count() / 
-        (m_base_time.count()/m_primal_mc_iterations);   
+    m_all_results["compiler data"]["Compilation time"]= cmpl_time.count();
+    if (m_base_time.count() > 0) {
+        m_all_results["compiler data"]["Compilation time / (Base time / Iterations)"]=cmpl_time.count() /
+            (m_base_time.count()/m_primal_mc_iterations);
+    }
     
     m_all_results["compiler data"]["Code size forward"]= m_aad_funcs->getCodeSizeFwd();
     m_all_results["compiler data"]["Code size reverse"]= m_aad_funcs->getCodeSizeRev();
@@ -580,14 +594,16 @@ void XVAJobRequest<mmType>::aADExecution(const json& request_data, int threads_n
     m_aad_results["DVA"]=thread_results[0].DVA;
     
     std::cout << std::setprecision(14);
-    std::cout << "AADC CVA: "  << thread_results[0].CVA << 
-        ". Compare with primal result: " << m_all_results["primal"]["CVA"].template get<double>() << "\n";
-    std::cout << "aadc-CVA - primal-CVA: " << 
-        thread_results[0].CVA - m_all_results["primal"]["CVA"].template get<double>() << "\n";
-    std::cout << "AADC DVA: "  << thread_results[0].DVA << 
-        ". Compare with primal result: " << m_all_results["primal"]["DVA"].template get<double>() << "\n";
-    std::cout << "aadc-DVA - primal-DVA: " << 
-        thread_results[0].DVA - m_all_results["primal"]["DVA"].template get<double>() << "\n";
+    std::cout << "AADC CVA: "  << thread_results[0].CVA << "\n";
+    std::cout << "AADC DVA: "  << thread_results[0].DVA << "\n";
+    if (m_primal_is_required) {
+        std::cout << "Compare with primal CVA: " << m_all_results["primal"]["CVA"].template get<double>() << "\n";
+        std::cout << "aadc-CVA - primal-CVA: " <<
+            thread_results[0].CVA - m_all_results["primal"]["CVA"].template get<double>() << "\n";
+        std::cout << "Compare with primal DVA: " << m_all_results["primal"]["DVA"].template get<double>() << "\n";
+        std::cout << "aadc-DVA - primal-DVA: " <<
+            thread_results[0].DVA - m_all_results["primal"]["DVA"].template get<double>() << "\n";
+    }
 
     m_aad_results["PEE"]=thread_results[0].PEE;
     m_aad_results["NEE"]=thread_results[0].NEE;
@@ -769,8 +785,15 @@ void XVAJobRequest<mmType>::processRequest(
     std::cout << "----------------------------\n";
     m_AVX_size = sizeof(mmType) / sizeof(double);
     init(request_data, threads_num);
-    if (m_primal_is_required) primal(request_data);
-    // Look if required structure exists in the cache already. Otherwise a new AADC-function will be compiled. 
+    if (m_primal_is_required) {
+        primal(request_data);  // primal() calls generateRandoms() internally
+    } else {
+        // Generate randoms for AADC even when primal is skipped
+        XVAProblem<double> XVA_tmp;
+        XVA_tmp.initData(request_data);
+        generateRandoms(XVA_tmp.numberOfRandomVars());
+    }
+    // Look if required structure exists in the cache already. Otherwise a new AADC-function will be compiled.
     auto cached_func_i = m_func_request_cache->begin();
     while (cached_func_i != m_func_request_cache->end() && cached_func_i->modified_request_data != m_data) ++cached_func_i;
     if (cached_func_i != m_func_request_cache->end()) {
@@ -805,16 +828,19 @@ void XVAJobRequest<mmType>::processRequest(
         m_func_request_cache->push_back(temp_obj);
     }
     aADExecution(request_data, threads_num, cancel);
+#ifdef HAS_ADEPT
     if (m_primal_is_required && m_adept_is_required) adept(request_data);
+#endif
     if (m_primal_and_bumps_are_required) bumpAndRevalue(request_data);
     data_out=m_all_results;
 }
 
+#ifdef HAS_ADEPT
 ////////////////////////////////////////////////////
 //
 //  XVAJobRequest<mmType>::adept
 //
-//  Implements computations of xVAs sensitivites using ADEPT AAD library 
+//  Implements computations of xVAs sensitivites using ADEPT AAD library
 //
 //  request_data    XVA task configuration
 //
@@ -905,3 +931,4 @@ void XVAJobRequest<mmType>::adept(const json& request_data) {
     ;    
     // end of Adept time measurement
 }
+#endif // HAS_ADEPT
