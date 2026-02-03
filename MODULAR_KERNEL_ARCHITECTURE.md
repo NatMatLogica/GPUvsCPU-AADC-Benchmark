@@ -282,6 +282,44 @@ cpp_aadc: 36.9s / 10,000 paths = 3.7ms per path for CVA + 244 sensitivities
 
 **Bottom line:** The modular architecture trades sensitivity computation for speed. If you need sensitivities, cpp_aadc is actually very efficient (244× faster than bump-and-revalue). If you only need CVA values, the modular approach is faster.
 
+### Clarification: What "Sensitivity Params" Actually Means
+
+**WARNING:** The CSV `num_sensitivity_params` column is misleading across backends:
+
+| Backend | Reported Params | What They Actually Are |
+|---------|-----------------|------------------------|
+| `cpp_aadc` | 244 | ✓ **TRUE GREEKS**: dCVA/dr0, dCVA/dσ, dCVA/dθ(t) × 120, dCVA/dSurvival × 122 |
+| `pathwise_gpu` | 244 | ✓ **TRUE GREEKS**: Same as cpp_aadc (computed via pathwise AD) |
+| `aadc_modular` | 244 | ✗ **Intermediates**: dCVA/dV_portfolio(t) for 122 pricing times × 2 |
+| `modular_gpu` | 5 | ✗ **Trade type count**: Number of cached kernels, NOT sensitivities |
+
+**Key distinction:**
+- `cpp_aadc` and `pathwise_gpu` compute **market-level Greeks** (what traders need for hedging)
+- `aadc_modular` computes **exposure-level derivatives** (dCVA/dV(t) — useful for aggregation, not hedging)
+- `modular_gpu` reports trade types as "sensitivity params" (this is a logging bug)
+
+### Production Benchmark: cpp_aadc at Full Capacity (16 threads)
+
+**Configuration:** 50 trades, 10,000 paths, 16 threads, 244 true market Greeks
+
+| Phase | Compilation | Execution | Total |
+|-------|-------------|-----------|-------|
+| Cold start | 5.7s | 10.5s | **16.7s** |
+| Warm (kernel reused) | 0.0s | 10.5s | **10.5s** |
+
+**Publishable comparison (same portfolio, same paths):**
+
+| Backend | Time | True Market Greeks | Notes |
+|---------|------|-------------------|-------|
+| gpu_brute_force | 0.7s | 0 | CVA only, no sensitivities |
+| pathwise_gpu | 0.8s | 244 ✓ | GPU pathwise AD |
+| cpp_aadc (16T, warm) | **10.5s** | 244 ✓ | Full reverse-mode AD, kernel reused |
+| cpp_aadc (16T, cold) | 16.7s | 244 ✓ | Includes kernel compilation |
+
+**Narrative for publication:**
+
+> "Full-stack reverse-mode AD with all 244 analytic market Greeks in **10.5s** on CPU (with kernel reuse) vs GPU pathwise derivatives in **0.8s**. The CPU AADC approach offers exact derivatives with no noise, while GPU pathwise achieves 13× speedup with equivalent accuracy. GPU brute-force finite differences would require 244 bumps × 0.7s = **170s** and introduces numerical noise."
+
 ### Getting Both: Possible Approaches
 
 To achieve **both** kernel reuse **and** full sensitivities:
