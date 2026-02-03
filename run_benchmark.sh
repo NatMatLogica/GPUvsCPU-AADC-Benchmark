@@ -108,7 +108,7 @@ run_aadc() {
 
     # If primal excluded, create temp config with "Primal Is Requred": false
     if ! $RUN_PRIMAL; then
-        actual_config="/tmp/$(basename "$config_file" .json)_no_primal.json"
+        actual_config=".tmp_$(basename "$config_file" .json)_no_primal.json"
         python3 -c "
 import json
 with open('$config_file') as f:
