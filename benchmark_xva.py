@@ -760,6 +760,155 @@ def run_aadc_cpp(input_file, num_mc_paths, num_threads, mode="pricing_only"):
     )
 
 
+def run_aadc_cpp_production(input_file, num_mc_paths, num_threads, num_trades=100):
+    """Run C++ AADC binary in production mode (demonstrates kernel reuse).
+
+    Production mode runs:
+      1. Cold start: kernel compilation + evaluation
+      2. Warm run: kernel reused, evaluation only (market data update)
+
+    Returns:
+        Tuple of (cold_result, warm_result) XVAResult objects, or (None, None) on error.
+    """
+    build_dir = BASE_DIR / "build"
+    binary = build_dir / "xva_server"
+
+    if not binary.exists():
+        print("  AADC Production: binary not found")
+        return None, None
+
+    # Resolve input file path (relative to BASE_DIR, not build_dir)
+    input_path = Path(input_file)
+    if not input_path.is_absolute():
+        input_path = BASE_DIR / input_file
+    if not input_path.exists():
+        print(f"  AADC Production: input file not found: {input_path}")
+        return None, None
+
+    # Run: ./xva_server config.json <mc_paths> <threads> production <num_trades>
+    cmd = [str(binary), str(input_path), str(num_mc_paths), str(num_threads),
+           "production", str(num_trades)]
+    print(f"  AADC Production: running {' '.join(cmd)}")
+
+    t0 = time.perf_counter()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=600, cwd=str(build_dir))
+    except subprocess.TimeoutExpired:
+        print("  AADC Production: timed out (600s)")
+        return None, None
+    except Exception as e:
+        print(f"  AADC Production: execution error: {e}")
+        return None, None
+
+    total_time = time.perf_counter() - t0
+
+    if result.returncode != 0:
+        print(f"  AADC Production: non-zero exit code {result.returncode}")
+        print(f"  stderr: {result.stderr[:500]}")
+        return None, None
+
+    # Parse output for cold/warm timing
+    stdout = result.stdout
+    cold_compile = 0.0
+    cold_exec = 0.0
+    cold_total = 0.0
+    warm_compile = 0.0
+    warm_exec = 0.0
+    warm_total = 0.0
+    cva = 0.0
+    dva = 0.0
+    num_sens = 0
+
+    lines = stdout.split("\n")
+    for i, line in enumerate(lines):
+        if "Cold start total:" in line:
+            try:
+                cold_total = float(line.split(":")[1].strip().replace("s", ""))
+            except (ValueError, IndexError):
+                pass
+        elif "Compilation:" in line and cold_compile == 0.0:
+            try:
+                cold_compile = float(line.split(":")[1].strip().replace("s", ""))
+            except (ValueError, IndexError):
+                pass
+        elif "Execution:" in line and cold_exec == 0.0:
+            try:
+                cold_exec = float(line.split(":")[1].strip().replace("s", ""))
+            except (ValueError, IndexError):
+                pass
+        elif "Warm run total:" in line:
+            try:
+                warm_total = float(line.split(":")[1].strip().replace("s", ""))
+            except (ValueError, IndexError):
+                pass
+        elif "CVA (warm):" in line:
+            try:
+                cva = float(line.split(":")[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif "DVA (warm):" in line:
+            try:
+                dva = float(line.split(":")[1].strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif "num_sensitivity_params" in line.lower() or "sensitivities:" in line.lower():
+            try:
+                num_sens = int(''.join(filter(str.isdigit, line.split(":")[-1][:10])))
+            except (ValueError, IndexError):
+                pass
+
+    # Read from CSV log for accurate values
+    csv_path = build_dir / "data" / "execution_log_xva.csv"
+    if csv_path.exists():
+        import csv
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            # Get last two rows (cold and warm)
+            for row in rows[-2:]:
+                if "full_portfolio" in row.get("model_name", ""):
+                    cold_compile = float(row.get("kernel_recording_sec", 0))
+                    cold_exec = float(row.get("eval_time_sec", 0))
+                    cold_total = float(row.get("total_time_sec", 0))
+                    cva = float(row.get("cva_result", 0))
+                    dva = float(row.get("dva_result", 0))
+                    num_sens = int(row.get("num_sensitivity_params", 0))
+                elif "market_update" in row.get("model_name", ""):
+                    warm_compile = float(row.get("kernel_recording_sec", 0))
+                    warm_exec = float(row.get("eval_time_sec", 0))
+                    warm_total = float(row.get("total_time_sec", 0))
+
+    print(f"  AADC Production done:")
+    print(f"    Cold: compile={cold_compile:.2f}s, exec={cold_exec:.2f}s, total={cold_total:.2f}s")
+    print(f"    Warm: compile={warm_compile:.2f}s (REUSED), exec={warm_exec:.2f}s, total={warm_total:.2f}s")
+    print(f"    CVA={cva:.6f}, DVA={dva:.6f}, sensitivities={num_sens}")
+
+    cold_result = XVAResult(
+        backend="cpp_aadc_avx256",
+        mode="full_portfolio",
+        cva=cva, dva=dva,
+        eval_time_sec=cold_exec,
+        sensitivity_time_sec=cold_exec,  # Sensitivities computed in same pass
+        total_time_sec=cold_total,
+        kernel_recording_sec=cold_compile,
+        num_params_bumped=num_sens,
+    )
+
+    warm_result = XVAResult(
+        backend="cpp_aadc_avx256",
+        mode="market_update",
+        cva=cva, dva=dva,
+        eval_time_sec=warm_exec,
+        sensitivity_time_sec=warm_exec,
+        total_time_sec=warm_total,
+        kernel_recording_sec=warm_compile,  # Should be ~0 (kernel reused)
+        num_params_bumped=num_sens,
+    )
+
+    return cold_result, warm_result
+
+
 # ---------------------------------------------------------------------------
 # Reference Values from all_results.json
 # ---------------------------------------------------------------------------

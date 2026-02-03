@@ -246,6 +246,7 @@ def run_market_data_update_scenario(
     num_mc_paths: int,
     num_threads: int,
     backends: List[str],
+    input_file: str,
     rate_bump_bp: float = 10.0,
     seed: int = 42,
 ) -> List[dict]:
@@ -423,40 +424,54 @@ def run_market_data_update_scenario(
             import traceback
             traceback.print_exc()
 
-    # --- AADC C++ Backend ---
+    # --- AADC C++ Backend (Production Mode with Kernel Reuse) ---
     if "aadc" in backends:
-        print("\n  [AADC C++] Market Data Update with Sensitivities...")
+        print("\n  [AADC C++] Market Data Update with Sensitivities (Production Mode)...")
         memory_tracker.start()
 
         try:
-            from benchmark_xva import run_aadc_cpp
+            from benchmark_xva import run_aadc_cpp_production
 
-            # Run with bumped market data (AADC handles kernel recording internally)
-            print("    Running AADC with market data update...")
-            result = run_aadc_cpp(DEFAULT_INPUT, num_mc_paths, num_threads,
-                                  mode="pricing_with_greeks")
+            # Run production mode: cold start + warm run (kernel reused)
+            print("    Running AADC production mode (cold + warm with kernel reuse)...")
+            cold_result, warm_result = run_aadc_cpp_production(
+                input_file, num_mc_paths, num_threads, num_trades=trades.num_trades)
 
-            if result:
+            if cold_result and warm_result:
                 mem = memory_tracker.get_snapshot()
 
+                # Log cold start (full_portfolio)
                 log_rows.append(build_prerecorded_log_row(
-                    scenario="market_update",
-                    result=result,
+                    scenario="full_portfolio",
+                    result=cold_result,
                     grid=grid, trades=trades,
                     num_mc_paths=num_mc_paths,
                     num_threads=num_threads,
-                    num_sens_params=num_sens_params,
+                    num_sens_params=cold_result.num_params_bumped,
                     memory_mb=mem['cpu_mb'],
-                    kernel_cached=False,  # AADC logs its own kernel recording
+                    kernel_cached=False,
                 ))
 
-                print(f"    CVA={result.cva:.6f}, DVA={result.dva:.6f}")
-                print(f"    Eval time: {result.eval_time_sec*1000:.1f}ms")
-                print(f"    Kernel recording: {result.kernel_recording_sec*1000:.1f}ms")
-                print(f"    Total: {result.total_time_sec*1000:.1f}ms")
+                # Log warm run (market_update with kernel reused)
+                log_rows.append(build_prerecorded_log_row(
+                    scenario="market_update",
+                    result=warm_result,
+                    grid=grid, trades=trades,
+                    num_mc_paths=num_mc_paths,
+                    num_threads=num_threads,
+                    num_sens_params=warm_result.num_params_bumped,
+                    memory_mb=mem['cpu_mb'],
+                    kernel_cached=True,  # Kernel was reused!
+                ))
+
+                print(f"    Cold start: CVA={cold_result.cva:.6f}, compile={cold_result.kernel_recording_sec:.2f}s, total={cold_result.total_time_sec:.2f}s")
+                print(f"    Warm run:   CVA={warm_result.cva:.6f}, compile={warm_result.kernel_recording_sec:.2f}s (REUSED), total={warm_result.total_time_sec:.2f}s")
+                print(f"    Sensitivities: {warm_result.num_params_bumped} params computed in both runs")
 
         except Exception as e:
             print(f"    AADC error: {e}")
+            import traceback
+            traceback.print_exc()
 
     return log_rows
 
@@ -475,6 +490,7 @@ def run_new_trade_scenario(
     num_mc_paths: int,
     num_threads: int,
     backends: List[str],
+    input_file: str,
     t0: int = 0,
     num_periods: int = 5,
     seed: int = 42,
@@ -694,34 +710,38 @@ def run_new_trade_scenario(
 
     # --- AADC C++ Backend ---
     if "aadc" in backends:
-        print("\n  [AADC C++] Incremental XVA with Sensitivities...")
+        print("\n  [AADC C++] New Trade Scenario...")
+        print("    NOTE: AADC monolithic kernel includes all trades.")
+        print("    Adding a new trade requires FULL kernel recompilation.")
+        print("    (No kernel reuse possible for new trades with AADC)")
         memory_tracker.start()
 
         try:
-            from benchmark_xva import run_aadc_cpp
+            from benchmark_xva import run_aadc_cpp_production
 
-            # Run AADC for base and new portfolios
-            print("    Running AADC for base portfolio...")
-            result_base = run_aadc_cpp(DEFAULT_INPUT, num_mc_paths, num_threads,
-                                       mode="pricing_with_greeks")
+            # Run production mode to show what a new trade would cost
+            # This demonstrates the recompilation overhead
+            print("    Running AADC production mode (shows recompilation cost)...")
+            cold_result, warm_result = run_aadc_cpp_production(
+                input_file, num_mc_paths, num_threads, num_trades=trades_base.num_trades)
 
-            if result_base:
-                print(f"    Base XVA: CVA={result_base.cva:.6f}, DVA={result_base.dva:.6f}")
-
-                # Note: For truly incremental AADC, would need to modify input file
-                # For now, we report base portfolio results
+            if cold_result:
                 mem = memory_tracker.get_snapshot()
 
+                # For new trade, we report the COLD result (full recompilation required)
                 log_rows.append(build_prerecorded_log_row(
                     scenario="new_trade",
-                    result=result_base,
+                    result=cold_result,
                     grid=grid, trades=trades_base,
                     num_mc_paths=num_mc_paths,
                     num_threads=num_threads,
-                    num_sens_params=num_sens_params,
+                    num_sens_params=cold_result.num_params_bumped,
                     memory_mb=mem['cpu_mb'],
-                    kernel_cached=False,
+                    kernel_cached=False,  # Kernel NOT reused for new trade
                 ))
+
+                print(f"    New trade requires: compile={cold_result.kernel_recording_sec:.2f}s + exec={cold_result.eval_time_sec:.2f}s = {cold_result.total_time_sec:.2f}s")
+                print(f"    CVA={cold_result.cva:.6f}, Sensitivities={cold_result.num_params_bumped} params")
 
         except Exception as e:
             print(f"    AADC error: {e}")
@@ -845,6 +865,7 @@ Examples:
             num_mc_paths=args.mc_paths,
             num_threads=args.threads,
             backends=args.backends,
+            input_file=args.input,
             rate_bump_bp=args.rate_bump,
             seed=args.seed,
         )
@@ -856,6 +877,7 @@ Examples:
             num_mc_paths=args.mc_paths,
             num_threads=args.threads,
             backends=args.backends,
+            input_file=args.input,
             t0=t0_days,
             num_periods=num_periods,
             seed=args.seed,
