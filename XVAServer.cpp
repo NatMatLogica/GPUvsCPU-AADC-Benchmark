@@ -16,6 +16,96 @@ using json = nlohmann::json;
 
 ////////////////////////////////////////////////////
 //
+//  compute_xva_from_exposures
+//
+//  Compute CVA/DVA from PEE/NEE arrays using trapezoidal rule
+//  (same formula as XVAProblem::computeXVAMeasures)
+//
+////////////////////////////////////////////////////
+
+std::pair<double, double> compute_xva_from_exposures(
+    const std::vector<double>& pee,
+    const std::vector<double>& nee,
+    const json& data_in
+) {
+    // Build pricing times from config
+    int t0 = data_in["t0"].get<int>();
+    int max_t = data_in["ModelAndPricingTimes"]["T"].get<int>();
+    int model_step = data_in["ModelAndPricingTimes"]["step"].get<int>();
+    int pricing_freq = data_in["ModelAndPricingTimes"]["PricingFreq"].get<int>();
+
+    std::vector<int> pricing_times;
+    int pr = 0;
+    int t = t0;
+    while (t < max_t) {
+        if (pr == 0 || (t + model_step > max_t)) {
+            pricing_times.push_back(t);
+            pr = pricing_freq;
+        }
+        --pr;
+        t += model_step;
+    }
+
+    // Build survival curves from config
+    auto build_surv_curve = [&](const json& curve_data) -> std::vector<std::pair<int, double>> {
+        std::vector<std::pair<int, double>> curve;
+        int step = curve_data["step"].get<int>();
+        int curve_max_t = curve_data["T"].get<int>();
+        double rate = curve_data["flat_rate"].get<double>();
+        int ct = t0;
+        while (ct < curve_max_t) {
+            curve.push_back({ct, rate});
+            ct += step;
+        }
+        return curve;
+    };
+
+    auto ctrparty_curve = build_surv_curve(data_in["CounterPartySurvivalCurve"]);
+    auto company_curve = build_surv_curve(data_in["CompanySurvivalCurve"]);
+
+    // Linear interpolation for survival probability: exp(-rate * yearfrac)
+    auto get_survival = [&](const std::vector<std::pair<int, double>>& curve, int time) -> double {
+        if (curve.empty()) return 1.0;
+        // Find surrounding points
+        double rate = curve[0].second;  // Default to first rate
+        for (size_t i = 0; i < curve.size(); ++i) {
+            if (curve[i].first <= time) {
+                rate = curve[i].second;
+                // Linear interpolation if not at end
+                if (i + 1 < curve.size() && curve[i + 1].first > time) {
+                    double frac = double(time - curve[i].first) /
+                                  double(curve[i + 1].first - curve[i].first);
+                    rate = curve[i].second + frac * (curve[i + 1].second - curve[i].second);
+                }
+            }
+        }
+        double yearfrac = double(time - t0) / 365.0;
+        return std::exp(-rate * yearfrac);
+    };
+
+    // Trapezoidal rule for CVA/DVA integration
+    double cva = 0.0, dva = 0.0;
+    size_t n = std::min(pee.size(), pricing_times.size());
+    if (n < 2) return {0.0, 0.0};
+
+    double ctrparty_next = get_survival(ctrparty_curve, pricing_times[0]);
+    double company_next = get_survival(company_curve, pricing_times[0]);
+
+    for (size_t i = 0; i < n - 1; ++i) {
+        double ctrparty_prev = ctrparty_next;
+        ctrparty_next = get_survival(ctrparty_curve, pricing_times[i + 1]);
+        double company_prev = company_next;
+        company_next = get_survival(company_curve, pricing_times[i + 1]);
+
+        cva += (pee[i] + pee[i + 1]) * (ctrparty_prev - ctrparty_next) * 0.5;
+        dva += (nee[i] + nee[i + 1]) * (company_prev - company_next) * 0.5;
+    }
+
+    return {cva, dva};
+}
+
+////////////////////////////////////////////////////
+//
 //  get_iso_timestamp
 //
 //  Returns current time as ISO 8601 string
@@ -262,6 +352,29 @@ int run_pricing(const int threads_num, const std::string input_file) {
     if (data_out.contains("AADC results")) {
         aadc_cva = data_out["AADC results"]["CVA"].get<double>();
         aadc_dva = data_out["AADC results"]["DVA"].get<double>();
+
+        // If AADC CVA/DVA are 0, compute from PEE/NEE arrays
+        if (aadc_cva == 0.0 && aadc_dva == 0.0 &&
+            data_out["AADC results"].contains("PEE") &&
+            data_out["AADC results"].contains("NEE")) {
+            std::vector<double> pee = data_out["AADC results"]["PEE"].get<std::vector<double>>();
+            std::vector<double> nee = data_out["AADC results"]["NEE"].get<std::vector<double>>();
+
+            // Check if arrays have meaningful values
+            bool has_exposures = false;
+            for (double v : pee) if (v != 0.0) { has_exposures = true; break; }
+            if (!has_exposures) {
+                for (double v : nee) if (v != 0.0) { has_exposures = true; break; }
+            }
+
+            if (has_exposures) {
+                auto [computed_cva, computed_dva] = compute_xva_from_exposures(pee, nee, data_in);
+                aadc_cva = computed_cva;
+                aadc_dva = computed_dva;
+                std::cout << "  CVA/DVA computed from AADC exposures: CVA=" << aadc_cva
+                          << ", DVA=" << aadc_dva << "\n";
+            }
+        }
     }
 
     // Timing (microseconds -> seconds), normalized to full MC iterations
