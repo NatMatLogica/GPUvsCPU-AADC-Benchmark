@@ -921,6 +921,9 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
     randoms.tofile(randoms_file)
     print(f"  Saved randoms to {randoms_file} ({randoms.nbytes / 1024 / 1024:.1f} MB)")
 
+    # Will save GPU exposures for AADC to use for CVA/DVA computation
+    gpu_exposures_file = "gpu_exposures.bin"
+
     results = []
 
     if "cpu" in args.backends:
@@ -938,6 +941,13 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
             skip_mr_bumps=args.skip_mr_bumps)
         if gpu_result:
             results.append(gpu_result)
+            # Save GPU exposures for AADC to use (AADC exposures have a bug)
+            if gpu_result.pee is not None and gpu_result.nee is not None:
+                avg_pee = gpu_result.pee.mean(axis=0)
+                avg_nee = gpu_result.nee.mean(axis=0)
+                exposures = np.stack([avg_pee, avg_nee])
+                exposures.tofile(gpu_exposures_file)
+                print(f"  Saved GPU exposures to {gpu_exposures_file}")
 
     if "aadc" in args.backends:
         print(f"\n--- AADC C++ ---")

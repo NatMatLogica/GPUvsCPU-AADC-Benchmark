@@ -258,6 +258,12 @@ public:
             randoms_file.close();
             std::cout << "  Loaded " << m_mc_iterations << " paths x "
                       << num_randoms_per_path << " steps from file" << std::endl;
+            // Debug: print first few values to verify
+            std::cout << "  Path 0, first 5 steps: ";
+            for (int i = 0; i < std::min(5, num_randoms_per_path); i++) {
+                std::cout << m_randoms[0][i] << " ";
+            }
+            std::cout << std::endl;
         } else {
             // Generate randoms internally (may differ from Python due to normal_distribution impl)
             std::cout << "  Generating randoms internally (randoms.bin not found)..." << std::endl;

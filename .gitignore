@@ -22,3 +22,4 @@ res_aad.json
 res_dbl.json
 .tmp_*_no_primal.json
 randoms.bin
+gpu_exposures.bin

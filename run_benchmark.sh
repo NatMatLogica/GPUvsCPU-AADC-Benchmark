@@ -205,15 +205,17 @@ for cfg in "${SELECTED[@]}"; do
 
     separator "$cfg — $config_file ($trades trades × $periods CFs, $mc MC paths)"
 
+    # GPU runs first to generate randoms.bin for AADC to read
+    if $RUN_GPU || $RUN_PATHWISE; then
+        echo "--- GPU Backends ---"
+        run_gpu "$config_file" || true
+    fi
+
+    # AADC runs after GPU so it can read randoms.bin for matching results
     if $RUN_AADC; then
         echo ""
         echo "--- AADC C++ ---"
         run_aadc "$config_file" || true
-    fi
-
-    if $RUN_GPU || $RUN_PATHWISE; then
-        echo "--- GPU Backends ---"
-        run_gpu "$config_file" || true
     fi
 done
 
