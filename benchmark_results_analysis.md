@@ -70,6 +70,40 @@ The current benchmark is honest: it compares the **common industry practice** (G
 
 ---
 
+## Execution Log CSV Fields
+
+The benchmark results are logged to `data/execution_log_xva.csv`. Key timing fields:
+
+### GPU Timing Fields
+
+| Field | Description |
+|-------|-------------|
+| `kernel_recording_sec` | **One-time JIT compilation cost** — Numba compiling CUDA kernel to GPU code. Paid once on first run. |
+| `gpu_kernel_time_sec` | **Actual GPU kernel execution time** — Reusable after compilation. This is steady-state performance. |
+| `eval_time_sec` | Same as `gpu_kernel_time_sec` for GPU backends. |
+
+**Example from log:**
+```
+gpu_brute_force: kernel_recording=1.63s, gpu_kernel_time=0.20s
+```
+
+This means:
+- **First run (cold start):** 1.63s to compile + 0.20s to execute = 1.83s total
+- **Subsequent runs (warm):** 0.20s only (kernel is cached)
+
+### AADC Timing Fields
+
+| Field | Description |
+|-------|-------------|
+| `kernel_recording_sec` | **AADC kernel compilation time** — Building the AD tape and compiling to AVX2/AVX-512. |
+| `eval_time_sec` | **AADC kernel evaluation time** — Forward pass + reverse sweeps for all gradients. |
+
+### Workflow Benchmark Fields
+
+For workflow scenarios (`gpu_cached`, `gpu_incremental`, `aadc_cached`), `kernel_recording_sec=0` because we specifically measure the **cached kernel** scenario where JIT/compilation is already complete.
+
+---
+
 ## How the C++ AADC Actually Works
 
 Looking at `XVAJobRequest.h:778-836`, `processRequest()` does this:
