@@ -906,6 +906,11 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
     randoms = generate_randoms(num_paths, num_steps, seed=args.seed, fast=use_fast)
     print(f"  Random generation: {time.perf_counter() - t_gen:.2f}s")
 
+    # Save randoms to file for C++ AADC to use (ensures identical random numbers)
+    randoms_file = "randoms.bin"
+    randoms.tofile(randoms_file)
+    print(f"  Saved randoms to {randoms_file} ({randoms.nbytes / 1024 / 1024:.1f} MB)")
+
     results = []
 
     if "cpu" in args.backends:
