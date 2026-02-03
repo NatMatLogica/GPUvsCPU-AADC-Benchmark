@@ -36,9 +36,31 @@ No amount of GPU optimization (shared memory, streams, native CUDA, cuRAND) can 
 **How GPU practitioners achieve "1000x speedups" in practice:**
 
 1. **GPU AAD** — Implement reverse-mode AD directly in CUDA (best of both worlds)
-2. **Pathwise derivatives** — Analytically differentiate within MC paths (see `xva_pathwise_sketch.py`)
+2. **Pathwise derivatives** — Analytically differentiate within MC paths (see `xva_pathwise_gpu.py`)
 3. **Likelihood ratio method** — Compute Greeks as expectations without bumping
 4. **Mixed precision** — FP16/TF32 tensor cores vs FP64 (where "1000x" marketing claims originate)
+
+### Pathwise GPU Sensitivity Limitations
+
+The pathwise GPU kernel (`xva_pathwise_gpu.py`) computes sensitivities for:
+- **r0** (initial rate) — 1 param
+- **sigma** (volatility) — 1 param
+- **Counterparty survival curve** — 141 params (analytical, post-simulation)
+- **Company survival curve** — 141 params (analytical, post-simulation)
+
+**Total: 124 params** (r0 + sigma + survival curves computed during kernel)
+
+**Not implemented: Mean reversion curve sensitivities (120 params)**
+
+The MR curve has ~120 points (10 years × 12 months). Adding these to pathwise would require:
+- 51,200 paths × 122 pricing times × 120 MR × 8 bytes × 2 = **~14 GB** memory
+
+This exceeds typical GPU memory. Possible future approaches:
+1. **Batch MR sensitivities** — Compute in groups of ~10-20 params per kernel launch
+2. **Track only active MR points** — Linear interpolation means only 2 points active per timestep
+3. **Use brute-force for MR only** — Pathwise for r0/sigma/survival, bump-and-revalue for MR
+
+For fair comparison between backends, use `--skip-mr-bumps` to exclude MR from brute-force (124 params instead of 244).
 
 **Fair benchmark framing:**
 

@@ -363,7 +363,8 @@ def cpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
 # ---------------------------------------------------------------------------
 
 def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
-                       company_surv, ctrparty_surv, mode="pricing_only"):
+                       company_surv, ctrparty_surv, mode="pricing_only",
+                       skip_mr_bumps=False):
     """Run GPU brute-force simulation."""
     try:
         from numba.cuda import is_available as cuda_is_available
@@ -437,7 +438,8 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
         sens_time, num_bumped = gpu_bump_and_revalue(
             randoms, hw, grid, trades, csa, cumulat1, cumulat2,
             company_surv, ctrparty_surv, cva, dva, num_pricing,
-            base_pee=pee_gpu, base_nee=nee_gpu)
+            base_pee=pee_gpu, base_nee=nee_gpu,
+            skip_mr_bumps=skip_mr_bumps)
 
     total_time = primal_time + sens_time
     print(f"  GPU done: CVA={cva:.10f}, DVA={dva:.10f}")
@@ -460,16 +462,18 @@ def run_gpu_bruteforce(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
 
 def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
                          company_surv, ctrparty_surv, base_cva, base_dva,
-                         num_pricing, base_pee=None, base_nee=None):
+                         num_pricing, base_pee=None, base_nee=None,
+                         skip_mr_bumps=False):
     """Bump-and-revalue loop on GPU for all sensitivity parameters.
 
     Matches the C++ AADC sensitivity set exactly:
       - r0, sigma (require full MC re-simulation)
-      - Mean reversion curve points (require full MC re-simulation)
+      - Mean reversion curve points (require full MC re-simulation) - skipped if skip_mr_bumps=True
       - Company survival curve points (re-integration only, no re-simulation)
       - Counterparty survival curve points (re-integration only, no re-simulation)
 
     Uses CUDA streams for concurrent execution of independent bump scenarios.
+    Set skip_mr_bumps=True for fair comparison with pathwise GPU (which doesn't compute MR sensitivities).
     """
     from xva_gpu_kernel import run_gpu_simulation, run_gpu_simulation_streamed, compute_cva_dva
 
@@ -544,49 +548,53 @@ def gpu_bump_and_revalue(randoms, hw, grid, trades, csa, cumulat1, cumulat2,
     # Bump mean reversion curve points (requires full re-simulation)
     # Use CUDA streams for concurrent execution
     n_mr = len(hw.mean_rev_vals)
-    print(f"    Bumping {n_mr} mean reversion points on GPU (streamed)...")
 
-    from xva_gpu_kernel import GPUSimulationContext, run_gpu_simulation_streamed, collect_streamed_results
+    if skip_mr_bumps:
+        print(f"    Skipping {n_mr} mean reversion bumps (--skip-mr-bumps)")
+    else:
+        print(f"    Bumping {n_mr} mean reversion points on GPU (streamed)...")
 
-    # Determine optimal stream count based on GPU memory and MR points
-    # More streams = more concurrency, but each needs output buffers
-    num_streams = min(16, n_mr)  # Cap at 16 streams for memory efficiency
+        from xva_gpu_kernel import GPUSimulationContext, run_gpu_simulation_streamed, collect_streamed_results
 
-    # Create GPU context with pre-allocated resources
-    ctx = GPUSimulationContext(
-        randoms, hw, grid, trades, csa, cumulat1, cumulat2,
-        num_pricing, num_streams=num_streams
-    )
+        # Determine optimal stream count based on GPU memory and MR points
+        # More streams = more concurrency, but each needs output buffers
+        num_streams = min(16, n_mr)  # Cap at 16 streams for memory efficiency
 
-    # Process MR bumps in batches of num_streams
-    for batch_start in range(0, n_mr, num_streams):
-        batch_end = min(batch_start + num_streams, n_mr)
-        batch_size = batch_end - batch_start
+        # Create GPU context with pre-allocated resources
+        ctx = GPUSimulationContext(
+            randoms, hw, grid, trades, csa, cumulat1, cumulat2,
+            num_pricing, num_streams=num_streams
+        )
 
-        # Launch all bumps in this batch concurrently
-        for i in range(batch_size):
-            mr_idx = batch_start + i
-            stream_idx = i
+        # Process MR bumps in batches of num_streams
+        for batch_start in range(0, n_mr, num_streams):
+            batch_end = min(batch_start + num_streams, n_mr)
+            batch_size = batch_end - batch_start
 
-            # Prepare bumped curve
-            mr_bumped = hw.mean_rev_vals.copy()
-            mr_bumped[mr_idx] += bump
-            cum1_b, cum2_b = precompute_cumulatives(hw.mean_rev_times, mr_bumped, hw.alpha)
+            # Launch all bumps in this batch concurrently
+            for i in range(batch_size):
+                mr_idx = batch_start + i
+                stream_idx = i
 
-            # Launch on stream (non-blocking)
-            run_gpu_simulation_streamed(
-                ctx, hw.mean_rev_times, mr_bumped, cum1_b, cum2_b, stream_idx
-            )
+                # Prepare bumped curve
+                mr_bumped = hw.mean_rev_vals.copy()
+                mr_bumped[mr_idx] += bump
+                cum1_b, cum2_b = precompute_cumulatives(hw.mean_rev_times, mr_bumped, hw.alpha)
 
-        # Wait for this batch to complete before starting next
-        ctx.synchronize_all()
-        num_resim += batch_size
+                # Launch on stream (non-blocking)
+                run_gpu_simulation_streamed(
+                    ctx, hw.mean_rev_times, mr_bumped, cum1_b, cum2_b, stream_idx
+                )
 
-        if batch_end % 50 == 0 or batch_end == n_mr:
-            elapsed = time.perf_counter() - t0
-            print(f"      MR point {batch_end}/{n_mr} ({elapsed:.1f}s)")
+            # Wait for this batch to complete before starting next
+            ctx.synchronize_all()
+            num_resim += batch_size
 
-    ctx.close()
+            if batch_end % 50 == 0 or batch_end == n_mr:
+                elapsed = time.perf_counter() - t0
+                print(f"      MR point {batch_end}/{n_mr} ({elapsed:.1f}s)")
+
+        ctx.close()
 
     # Bump counterparty survival curve points (re-integration only, no re-simulation)
     n_ctrp = len(ctrparty_surv.values)
@@ -841,6 +849,8 @@ def main():
                         help="Random seed (default: 17)")
     parser.add_argument("--fast-rng", action="store_true",
                         help="Use NumPy RNG (fast but won't match C++)")
+    parser.add_argument("--skip-mr-bumps", action="store_true",
+                        help="Skip mean reversion curve bumps (for fair comparison with pathwise)")
     parser.add_argument("--no-log", action="store_true",
                         help="Skip CSV logging")
     args = parser.parse_args()
@@ -924,7 +934,8 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
         print(f"\n--- GPU Brute-Force ---")
         gpu_result = run_gpu_bruteforce(
             randoms, hw, grid, trades, csa, cumulat1, cumulat2,
-            company_surv, ctrparty_surv, mode=args.mode)
+            company_surv, ctrparty_surv, mode=args.mode,
+            skip_mr_bumps=args.skip_mr_bumps)
         if gpu_result:
             results.append(gpu_result)
 

@@ -11,9 +11,11 @@
 #   ./run_benchmark.sh micro -x gpu         # run micro, exclude GPU backends
 #   ./run_benchmark.sh small -x aadc,pathwise  # exclude multiple backends
 #   ./run_benchmark.sh small -x primal      # run AADC without slow primal baseline
+#   ./run_benchmark.sh small -x mr          # skip MR bumps (fair comparison with pathwise)
 #   THREADS=8 ./run_benchmark.sh medium     # override thread count via env
 #
 # Backends: aadc (C++), gpu (brute-force), pathwise (GPU pathwise derivatives)
+# Exclusions: -x aadc,gpu,pathwise,primal,mr (mr skips mean reversion bumps)
 # Configs:  micro (5 trades, 10K paths), small (50 trades, 16K paths),
 #           medium (200 trades, 32K paths), large (500 trades, 64K paths)
 
@@ -73,6 +75,7 @@ RUN_AADC=true
 RUN_GPU=true
 RUN_PATHWISE=true
 RUN_PRIMAL=true
+SKIP_MR_BUMPS=false
 
 if [[ -n "$EXCLUDE" ]]; then
     IFS=',' read -ra EXCL_ARRAY <<< "$EXCLUDE"
@@ -82,13 +85,14 @@ if [[ -n "$EXCLUDE" ]]; then
             gpu) RUN_GPU=false ;;
             pathwise) RUN_PATHWISE=false ;;
             primal) RUN_PRIMAL=false ;;
+            mr) SKIP_MR_BUMPS=true ;;
             *) echo "Warning: unknown backend to exclude: $excl" ;;
         esac
     done
 fi
 
 echo "Threads: $THREADS"
-echo "Backends: aadc=$RUN_AADC (primal=$RUN_PRIMAL), gpu=$RUN_GPU, pathwise=$RUN_PATHWISE"
+echo "Backends: aadc=$RUN_AADC (primal=$RUN_PRIMAL), gpu=$RUN_GPU, pathwise=$RUN_PATHWISE, skip_mr=$SKIP_MR_BUMPS"
 
 separator() {
     echo ""
@@ -153,9 +157,14 @@ run_gpu() {
         return 0
     fi
 
-    echo "  GPU Backends: $config_file ($backends)"
-    echo "  Command: python benchmark_xva.py --input-file $config_file --backends $backends --threads $THREADS"
-    python benchmark_xva.py --input-file "$config_file" --backends $backends --threads "$THREADS"
+    local extra_args=""
+    if $SKIP_MR_BUMPS; then
+        extra_args="--skip-mr-bumps"
+    fi
+
+    echo "  GPU Backends: $config_file ($backends) $extra_args"
+    echo "  Command: python benchmark_xva.py --input-file $config_file --backends $backends --threads $THREADS $extra_args"
+    python benchmark_xva.py --input-file "$config_file" --backends $backends --threads "$THREADS" $extra_args
     echo ""
 }
 
