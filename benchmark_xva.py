@@ -948,7 +948,7 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
         print_results(results, ref_cva, ref_dva, num_paths,
                       trades.num_trades, num_steps, num_pricing, num_sens_params)
 
-        # CSV logging
+        # CSV logging (skip AADC - C++ binary logs its own rows)
         if not args.no_log:
             cpu_time = 0.0
             for r in results:
@@ -956,13 +956,16 @@ def _run_benchmark(num_paths, args, hw, grid, trades, csa,
                     cpu_time = r.total_time_sec
             log_rows = []
             for r in results:
+                if r.backend == "aadc_cpu":
+                    continue  # C++ already logs xva_cpp_primal and xva_cpp_aadc
                 row = build_log_row(
                     r, grid, trades, num_paths, args.threads,
                     num_sens_params, cpu_time=cpu_time,
                     ref_cva=ref_cva, ref_dva=ref_dva)
                 log_rows.append(row)
-            write_xva_log(LOG_FILE, log_rows)
-            print(f"\nResults logged to {LOG_FILE}")
+            if log_rows:
+                write_xva_log(LOG_FILE, log_rows)
+                print(f"\nResults logged to {LOG_FILE}")
 
 
 if __name__ == "__main__":

@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # XVA Benchmark: AADC (C++) vs GPU Brute-Force (Python/CUDA)
 #
-# Runs both backends on bank_small, bank_medium, bank_large configs.
-# Results are logged to data/execution_log_xva.csv
+# Runs backends on selected configs. Results logged to data/execution_log_xva.csv
 #
 # Usage:
 #   ./run_benchmark.sh                      # run small/medium/large (16 threads)
-#   ./run_benchmark.sh micro                # run micro config (5 trades, 16 paths)
+#   ./run_benchmark.sh micro                # run micro config
 #   ./run_benchmark.sh small 8              # run one config with 8 threads
-#   ./run_benchmark.sh small medium         # run selected configs
-#   ./run_benchmark.sh small medium 4       # run selected configs with 4 threads
+#   ./run_benchmark.sh micro -x aadc        # run micro, exclude AADC
+#   ./run_benchmark.sh micro -x gpu         # run micro, exclude GPU backends
+#   ./run_benchmark.sh small -x aadc,pathwise  # exclude multiple backends
 #   THREADS=8 ./run_benchmark.sh medium     # override thread count via env
 #
-# Configs: micro (5 trades, 10K paths), small (50 trades, 16K paths),
-#          medium (200 trades, 32K paths), large (500 trades, 64K paths)
+# Backends: aadc (C++), gpu (brute-force), pathwise (GPU pathwise derivatives)
+# Configs:  micro (5 trades, 10K paths), small (50 trades, 16K paths),
+#           medium (200 trades, 32K paths), large (500 trades, 64K paths)
 
 set -euo pipefail
 
@@ -33,23 +34,32 @@ fi
 
 AADC_BINARY="./build/xva_server"
 THREADS="${THREADS:-16}"
+EXCLUDE=""
 
-# Config definitions: name json_file mc_paths aadc_threads
+# Config definitions
 declare -A CONFIGS
 CONFIGS[micro]="bank_micro.json"
 CONFIGS[small]="bank_small.json"
 CONFIGS[medium]="bank_medium.json"
 CONFIGS[large]="bank_large.json"
 
-# Select configs to run
-# If last argument is a number, use it as thread count
+# Parse arguments
 SELECTED=()
-for arg in "$@"; do
-    if [[ "$arg" =~ ^[0-9]+$ ]]; then
-        THREADS="$arg"
-    else
-        SELECTED+=("$arg")
-    fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x|--exclude)
+            EXCLUDE="$2"
+            shift 2
+            ;;
+        *)
+            if [[ "$1" =~ ^[0-9]+$ ]]; then
+                THREADS="$1"
+            else
+                SELECTED+=("$1")
+            fi
+            shift
+            ;;
+    esac
 done
 
 # Default to all configs if none specified (excluding micro)
@@ -57,7 +67,25 @@ if [[ ${#SELECTED[@]} -eq 0 ]]; then
     SELECTED=(small medium large)
 fi
 
+# Determine which backends to run
+RUN_AADC=true
+RUN_GPU=true
+RUN_PATHWISE=true
+
+if [[ -n "$EXCLUDE" ]]; then
+    IFS=',' read -ra EXCL_ARRAY <<< "$EXCLUDE"
+    for excl in "${EXCL_ARRAY[@]}"; do
+        case "$excl" in
+            aadc) RUN_AADC=false ;;
+            gpu) RUN_GPU=false ;;
+            pathwise) RUN_PATHWISE=false ;;
+            *) echo "Warning: unknown backend to exclude: $excl" ;;
+        esac
+    done
+fi
+
 echo "Threads: $THREADS"
+echo "Backends: aadc=$RUN_AADC, gpu=$RUN_GPU, pathwise=$RUN_PATHWISE"
 
 separator() {
     echo ""
@@ -88,14 +116,28 @@ run_aadc() {
 }
 
 # ------------------------------------------------------------------
-# Run GPU backends (brute-force + pathwise)
+# Run GPU backends (brute-force and/or pathwise)
 # ------------------------------------------------------------------
 run_gpu() {
     local config_file="$1"
+    local backends=""
 
-    echo "  GPU Backends: $config_file (brute-force + pathwise)"
-    echo "  Command: python benchmark_xva.py --input-file $config_file --backends gpu pathwise --mode pricing_with_greeks --threads $THREADS"
-    python benchmark_xva.py --input-file "$config_file" --backends gpu pathwise --mode pricing_with_greeks --threads "$THREADS"
+    if $RUN_GPU; then
+        backends="gpu"
+    fi
+    if $RUN_PATHWISE; then
+        backends="$backends pathwise"
+    fi
+    backends=$(echo "$backends" | xargs)  # trim whitespace
+
+    if [[ -z "$backends" ]]; then
+        echo "  Skipping GPU backends (excluded)"
+        return 0
+    fi
+
+    echo "  GPU Backends: $config_file ($backends)"
+    echo "  Command: python benchmark_xva.py --input-file $config_file --backends $backends --threads $THREADS"
+    python benchmark_xva.py --input-file "$config_file" --backends $backends --threads "$THREADS"
     echo ""
 }
 
@@ -126,12 +168,16 @@ for cfg in "${SELECTED[@]}"; do
 
     separator "$cfg — $config_file ($trades trades × $periods CFs, $mc MC paths)"
 
-    echo ""
-    echo "--- AADC C++ ---"
-    run_aadc "$config_file" || true
+    if $RUN_AADC; then
+        echo ""
+        echo "--- AADC C++ ---"
+        run_aadc "$config_file" || true
+    fi
 
-    echo "--- GPU Brute-Force ---"
-    run_gpu "$config_file" || true
+    if $RUN_GPU || $RUN_PATHWISE; then
+        echo "--- GPU Backends ---"
+        run_gpu "$config_file" || true
+    fi
 done
 
 separator "Done"
