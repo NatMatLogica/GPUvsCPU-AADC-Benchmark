@@ -182,6 +182,109 @@ results = aadc.evaluate(funcs, request, inputs, workers)
 | Market Update | **0ms (reused)** | 1828ms | 3ms | 1830ms |
 | New Trade | **0ms (reused)** | 3ms | 3ms | **6ms** |
 
+## CSV Log Model Names Explained
+
+The benchmark logs results to `data/execution_log_xva.csv` with different model names. Understanding these names requires understanding the fundamental difference in how GPU and AADC cache kernels.
+
+### GPU Model Names
+
+GPU kernels are cached **per trade type** (based on cash flow structure):
+
+| Model Name | Description |
+|------------|-------------|
+| `xva_modular_full_portfolio` | Initial run: compiles kernels for all trade types |
+| `xva_modular_market_update` | Market data changed: all kernels reused (0 compiles) |
+| `xva_modular_new_trade_existing_type` | New trade with known CF structure: kernel reused |
+| `xva_modular_new_trade_new_type` | New trade with new CF structure: must compile new kernel |
+
+**Why two "new trade" scenarios?**
+
+GPU groups trades by **trade type** (e.g., IRS_5Y, IRS_10Y, FRA_3M). Each type has a unique cash flow structure that determines the kernel:
+
+```
+IRS_5Y:  20 quarterly payments → kernel with 20 CF iterations
+IRS_10Y: 40 quarterly payments → kernel with 40 CF iterations (different kernel!)
+```
+
+When a new trade arrives:
+- **Existing type** (e.g., another IRS_5Y): Reuse cached kernel → **0ms compile**
+- **New type** (e.g., first IRS_15Y): Must compile new kernel → **305ms compile**
+
+### AADC Model Names (Python Modular)
+
+AADC kernel is cached **per pricing time grid** (independent of trades):
+
+| Model Name | Description |
+|------------|-------------|
+| `xva_aadc_modular_full_portfolio` | Initial run: records kernel with V_portfolio inputs |
+| `xva_aadc_modular_market_update` | Market data changed: kernel reused |
+| `xva_aadc_modular_new_trade` | Any new trade: kernel always reused |
+
+### C++ AADC Model Names (Monolithic)
+
+The C++ AADC implementation uses a **monolithic kernel** (all trades unrolled):
+
+| Model Name | Description |
+|------------|-------------|
+| `xva_cpp_aadc_full_portfolio` | Cold start: kernel compilation + evaluation |
+| `xva_cpp_aadc_market_update` | Warm run: kernel reused, only evaluation |
+
+**Note:** The C++ monolithic kernel benefits less from reuse (~10s savings) because:
+- Kernel size is O(trades) - all trades unrolled into single kernel
+- Large kernel = slower evaluation even when cached
+- The modular architecture (Python) achieves better separation
+
+**Why only one "new trade" scenario?**
+
+AADC kernel takes **aggregated portfolio values** at each pricing time as inputs:
+
+```python
+# Kernel inputs: V_portfolio(t) for t in [0, 1, ..., 121]
+# Kernel does NOT know about individual trades
+inputs = {v_handles[t]: portfolio_values[:, t] for t in range(122)}
+```
+
+The kernel size is O(pricing_times), **not** O(trade_count) or O(trade_types). Whether the portfolio has 100 trades or 1000 trades, or whether the new trade is IRS_5Y or IRS_15Y, the kernel is the same:
+
+```
+New IRS_5Y trade:  recompute V_portfolio → feed to SAME kernel → 0ms compile
+New IRS_15Y trade: recompute V_portfolio → feed to SAME kernel → 0ms compile
+```
+
+### Architecture Comparison
+
+```
+GPU Kernel Cache:                    AADC Kernel Cache:
+┌────────────────────┐              ┌────────────────────┐
+│ Trade Type → Kernel│              │ Grid → Kernel      │
+├────────────────────┤              ├────────────────────┤
+│ IRS_5Y   → K1      │              │ 122 pricing times  │
+│ IRS_10Y  → K2      │              │        ↓           │
+│ IRS_15Y  → K3      │              │   Single kernel    │
+│ FRA_3M   → K4      │              │   (CSA + CVA)      │
+│ ...      → ...     │              │                    │
+└────────────────────┘              └────────────────────┘
+     5-10 kernels                        1 kernel
+```
+
+| Aspect | GPU Modular | AADC Modular | C++ AADC Monolithic |
+|--------|-------------|--------------|---------------------|
+| Cache key | Trade type (CF structure) | Pricing time grid | All trades combined |
+| Typical cache size | 5-10 kernels | 1 kernel | 1 kernel |
+| New trade (existing type) | Reuse kernel | Reuse kernel | Recompile all |
+| New trade (new type) | Compile new kernel | Reuse kernel | Recompile all |
+| Kernel size | O(CF payments per type) | O(pricing times) | O(trades × CFs) |
+| Market update reuse | Yes | Yes | Yes |
+
+### When Does AADC Need Recompilation?
+
+AADC only needs to recompile if the **pricing time grid changes**:
+- Changing from 122 to 200 pricing times → recompile
+- Adding more granular pricing dates → recompile
+- Extending portfolio maturity beyond grid → recompile
+
+In production, the grid is fixed, so AADC achieves **true O(1) kernel reuse** for all trade operations.
+
 ## Files
 
 | File | Purpose |
