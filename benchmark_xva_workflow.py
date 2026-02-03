@@ -289,44 +289,44 @@ def run_market_data_update(
         try:
             from benchmark_xva import run_aadc_cpp
 
-            # First run: kernel compilation
+            # First run: kernel compilation with base config
             print("    Recording kernel (AADC compilation)...")
             result_initial = run_aadc_cpp(
-                randoms, hw_base, grid, trades, csa, cumulat1, cumulat2,
-                company_surv, ctrparty_surv,
-                num_threads=num_threads,
+                str(BASE_DIR / "initData.json"),
+                num_mc_paths,
+                num_threads,
                 mode="pricing_only",
             )
             if result_initial:
                 compile_time = result_initial.kernel_recording_sec
                 print(f"    Kernel compiled: {compile_time:.3f}s")
+                print(f"    Base CVA={result_initial.cva:.6f}, DVA={result_initial.dva:.6f}")
 
-                # Market data update: reuse compiled kernel
-                hw_bumped = HWModelParams(
-                    alpha=hw_base.alpha,
-                    sigma=hw_base.sigma,
-                    r0=hw_base.r0 + 0.001,
-                    mean_rev_times=hw_base.mean_rev_times,
-                    mean_rev_vals=hw_base.mean_rev_vals,
-                    spread_3m_times=hw_base.spread_3m_times,
-                    spread_3m_vals=hw_base.spread_3m_vals,
-                    spread_6m_times=hw_base.spread_6m_times,
-                    spread_6m_vals=hw_base.spread_6m_vals,
-                    spread_12m_times=hw_base.spread_12m_times,
-                    spread_12m_vals=hw_base.spread_12m_vals,
-                )
-                cumulat1_b, cumulat2_b = precompute_cumulatives(
-                    hw_bumped.mean_rev_times, hw_bumped.mean_rev_vals, hw_bumped.alpha)
+                # Create modified config with bumped r0 (+10bp)
+                import json
+                import tempfile
+                with open(BASE_DIR / "initData.json") as f:
+                    config = json.load(f)
 
-                print("    Recalculating with market data update...")
-                t_eval = time.perf_counter()
+                # Bump r0 by 10bp
+                config["Currencies.EUR"]["r0"] = config["Currencies.EUR"].get("r0", 0.08) + 0.001
+                config["Portfolio"]["NumRandomTrades"] = trades.num_trades
+
+                # Write to temp file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
+                    json.dump(config, tf)
+                    temp_config = tf.name
+
+                print("    Recalculating with market data update (r0 +10bp)...")
                 result_updated = run_aadc_cpp(
-                    randoms, hw_bumped, grid, trades, csa, cumulat1_b, cumulat2_b,
-                    company_surv, ctrparty_surv,
-                    num_threads=num_threads,
+                    temp_config,
+                    num_mc_paths,
+                    num_threads,
                     mode="pricing_only",
                 )
-                eval_time = time.perf_counter() - t_eval
+
+                # Clean up temp file
+                os.unlink(temp_config)
 
                 if result_updated:
                     mem = _memory_tracker.get_snapshot()
@@ -356,12 +356,14 @@ def run_market_data_update(
                         kernel_cached=True,
                     ))
 
-                    print(f"    CVA={result_updated.cva:.6f}, DVA={result_updated.dva:.6f}")
-                    print(f"    Eval time (cached): {result_updated.eval_time_sec*1000:.1f}ms")
+                    print(f"    Updated CVA={result_updated.cva:.6f}, DVA={result_updated.dva:.6f}")
+                    print(f"    Eval time: {result_updated.eval_time_sec*1000:.1f}ms")
                     print(f"    Memory: CPU={mem['cpu_mb']:.1f}MB")
 
         except Exception as e:
+            import traceback
             print(f"    AADC error: {e}")
+            traceback.print_exc()
 
     # Write logs
     if log_rows:
@@ -512,30 +514,46 @@ def run_incremental_trade(
 
         try:
             from benchmark_xva import run_aadc_cpp
+            import json
+            import tempfile
+
+            # Load base config
+            with open(BASE_DIR / "initData.json") as f:
+                config = json.load(f)
 
             # Base portfolio XVA
-            print("    Computing base portfolio XVA...")
+            config["Portfolio"]["NumRandomTrades"] = trades_base.num_trades
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
+                json.dump(config, tf)
+                temp_base = tf.name
+
+            print(f"    Computing base portfolio XVA ({trades_base.num_trades} trades)...")
             result_base = run_aadc_cpp(
-                randoms, hw, grid, trades_base, csa, cumulat1, cumulat2,
-                company_surv, ctrparty_surv,
-                num_threads=num_threads,
+                temp_base,
+                num_mc_paths,
+                num_threads,
                 mode="pricing_only",
             )
+            os.unlink(temp_base)
 
             if result_base:
                 compile_time = result_base.kernel_recording_sec
                 print(f"    Base XVA: CVA={result_base.cva:.6f}, DVA={result_base.dva:.6f}")
 
                 # Portfolio + new trade XVA
-                print("    Computing portfolio + new trade XVA...")
-                t_incr = time.perf_counter()
+                config["Portfolio"]["NumRandomTrades"] = trades_new.num_trades
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tf:
+                    json.dump(config, tf)
+                    temp_new = tf.name
+
+                print(f"    Computing portfolio + new trade XVA ({trades_new.num_trades} trades)...")
                 result_new = run_aadc_cpp(
-                    randoms, hw, grid, trades_new, csa, cumulat1, cumulat2,
-                    company_surv, ctrparty_surv,
-                    num_threads=num_threads,
+                    temp_new,
+                    num_mc_paths,
+                    num_threads,
                     mode="pricing_only",
                 )
-                incr_time = time.perf_counter() - t_incr
+                os.unlink(temp_new)
 
                 if result_new:
                     delta_cva = result_new.cva - result_base.cva
@@ -573,7 +591,9 @@ def run_incremental_trade(
                     print(f"    Memory: CPU={mem['cpu_mb']:.1f}MB")
 
         except Exception as e:
+            import traceback
             print(f"    AADC error: {e}")
+            traceback.print_exc()
 
     # Write logs
     if log_rows:
