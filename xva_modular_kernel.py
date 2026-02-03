@@ -30,7 +30,7 @@ Version: 1.0.0
 import numpy as np
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from numba import cuda, float64, int32
 from datetime import datetime
 from pathlib import Path
@@ -529,14 +529,23 @@ class ModularXVAEngine:
     def compute_cva_dva(self, portfolio_values: np.ndarray,
                         pricing_times: np.ndarray,
                         ctrparty_surv: np.ndarray,
-                        company_surv: np.ndarray) -> Tuple[float, float, np.ndarray, np.ndarray]:
+                        company_surv: np.ndarray,
+                        compute_sensitivities: bool = False) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[dict]]:
         """Compute CVA/DVA using CSA kernel.
+
+        Args:
+            portfolio_values: (num_paths, num_pricing_times) array
+            pricing_times: (num_pricing_times,) pricing grid
+            ctrparty_surv: (num_pricing_times,) counterparty survival curve
+            company_surv: (num_pricing_times,) company survival curve
+            compute_sensitivities: if True, compute d(CVA)/d(V_t), d(DVA)/d(V_t) via bump-and-revalue
 
         Returns:
             cva: scalar (mean across paths)
             dva: scalar (mean across paths)
             pee: (num_paths, num_pricing_times) array
             nee: (num_paths, num_pricing_times) array
+            sensitivities: dict or None
         """
         num_paths, num_pricing_times = portfolio_values.shape
 
@@ -580,15 +589,123 @@ class ModularXVAEngine:
         pee = d_pee.copy_to_host()
         nee = d_nee.copy_to_host()
 
-        return np.mean(cva_paths), np.mean(dva_paths), pee, nee
+        base_cva = np.mean(cva_paths)
+        base_dva = np.mean(dva_paths)
+
+        sensitivities = None
+        if compute_sensitivities:
+            sensitivities = self._compute_sensitivities_bump_and_revalue(
+                portfolio_values, pricing_times, ctrparty_surv, company_surv,
+                base_cva, base_dva
+            )
+
+        return base_cva, base_dva, pee, nee, sensitivities
+
+    def _compute_sensitivities_bump_and_revalue(
+            self, portfolio_values: np.ndarray,
+            pricing_times: np.ndarray,
+            ctrparty_surv: np.ndarray,
+            company_surv: np.ndarray,
+            base_cva: float, base_dva: float,
+            bump_size: float = 1e-4) -> dict:
+        """Compute sensitivities via bump-and-revalue (finite differences).
+
+        Computes d(CVA)/d(V_t) and d(DVA)/d(V_t) for each pricing time t.
+
+        Args:
+            portfolio_values: (num_paths, num_pricing_times) base portfolio values
+            pricing_times: (num_pricing_times,) pricing grid
+            ctrparty_surv: (num_pricing_times,) counterparty survival curve
+            company_surv: (num_pricing_times,) company survival curve
+            base_cva: base CVA value
+            base_dva: base DVA value
+            bump_size: finite difference bump size
+
+        Returns:
+            dict with 'dcva_dv', 'ddva_dv', 'num_params', 'sensitivity_time_sec'
+        """
+        num_paths, num_pricing_times = portfolio_values.shape
+        dcva_dv = np.zeros(num_pricing_times)
+        ddva_dv = np.zeros(num_pricing_times)
+
+        t_start = time.perf_counter()
+
+        # Pre-allocate GPU arrays for reuse
+        d_pricing_times = cuda.to_device(pricing_times.astype(np.float64))
+        d_ctrparty_surv = cuda.to_device(ctrparty_surv.astype(np.float64))
+        d_company_surv = cuda.to_device(company_surv.astype(np.float64))
+        d_pee = cuda.device_array((num_paths, num_pricing_times), dtype=np.float64)
+        d_nee = cuda.device_array((num_paths, num_pricing_times), dtype=np.float64)
+        d_cva = cuda.device_array(num_paths, dtype=np.float64)
+        d_dva = cuda.device_array(num_paths, dtype=np.float64)
+
+        threads = 256
+        blocks = (num_paths + threads - 1) // threads
+        dt = 1.0 / 365.0
+
+        # Bump each pricing time and revalue
+        for t_idx in range(num_pricing_times):
+            # Create bumped portfolio values
+            portfolio_bumped = portfolio_values.copy()
+            portfolio_bumped[:, t_idx] += bump_size
+
+            # Transfer bumped values to GPU
+            d_portfolio_bumped = cuda.to_device(portfolio_bumped)
+
+            # Run CSA+CVA kernel
+            csa_cva_kernel[blocks, threads](
+                d_portfolio_bumped,
+                self.csa_params['mta_h'],
+                self.csa_params['mta_l'],
+                self.csa_params['th'],
+                self.csa_params['tl'],
+                d_ctrparty_surv,
+                d_company_surv,
+                d_pricing_times,
+                dt,
+                d_pee,
+                d_nee,
+                d_cva,
+                d_dva
+            )
+            cuda.synchronize()
+
+            # Get bumped values
+            bumped_cva = np.mean(d_cva.copy_to_host())
+            bumped_dva = np.mean(d_dva.copy_to_host())
+
+            # Compute finite difference
+            dcva_dv[t_idx] = (bumped_cva - base_cva) / bump_size
+            ddva_dv[t_idx] = (bumped_dva - base_dva) / bump_size
+
+        sensitivity_time = time.perf_counter() - t_start
+
+        return {
+            'dcva_dv': dcva_dv,
+            'ddva_dv': ddva_dv,
+            'num_params': num_pricing_times * 2,  # CVA + DVA sensitivities
+            'sensitivity_time_sec': sensitivity_time,
+            'method': 'bump_and_revalue',
+            'bump_size': bump_size,
+        }
 
     def run_full_xva(self, trades: List[TradeData], randoms: np.ndarray,
                      pricing_times: np.ndarray,
                      ctrparty_surv: np.ndarray,
-                     company_surv: np.ndarray) -> dict:
+                     company_surv: np.ndarray,
+                     compute_sensitivities: bool = False) -> dict:
         """Run full XVA calculation with kernel reuse.
 
-        Returns dict with CVA, DVA, timings, and kernel stats.
+        Args:
+            trades: List of TradeData objects
+            randoms: (num_paths, num_steps) random numbers for rate simulation
+            pricing_times: (num_pricing_times,) pricing grid
+            ctrparty_surv: (num_pricing_times,) counterparty survival curve
+            company_surv: (num_pricing_times,) company survival curve
+            compute_sensitivities: if True, compute XVA sensitivities via bump-and-revalue
+
+        Returns:
+            dict with CVA, DVA, timings, kernel stats, and optionally sensitivities
         """
         # Step 1: Simulate rates
         t0 = time.perf_counter()
@@ -600,16 +717,22 @@ class ModularXVAEngine:
         portfolio_values, kernel_stats = self.value_portfolio(trades, rates, pricing_times)
         valuation_time = time.perf_counter() - t1
 
-        # Step 3: Compute CVA/DVA
+        # Step 3: Compute CVA/DVA (and sensitivities if requested)
         t2 = time.perf_counter()
-        cva, dva, pee, nee = self.compute_cva_dva(
-            portfolio_values, pricing_times, ctrparty_surv, company_surv
+        cva, dva, pee, nee, sensitivities = self.compute_cva_dva(
+            portfolio_values, pricing_times, ctrparty_surv, company_surv,
+            compute_sensitivities=compute_sensitivities
         )
         cva_time = time.perf_counter() - t2
 
         total_time = time.perf_counter() - t0
 
-        return {
+        # Extract sensitivity timing if computed
+        sensitivity_time = 0.0
+        if sensitivities is not None:
+            sensitivity_time = sensitivities.get('sensitivity_time_sec', 0.0)
+
+        result = {
             'cva': cva,
             'dva': dva,
             'pee': pee,
@@ -617,21 +740,41 @@ class ModularXVAEngine:
             'rates_time_sec': rates_time,
             'valuation_time_sec': valuation_time,
             'cva_time_sec': cva_time,
+            'sensitivity_time_sec': sensitivity_time,
             'total_time_sec': total_time,
             'kernel_stats': kernel_stats,
             'cache_stats': self.kernel_cache.stats()
         }
+
+        if sensitivities is not None:
+            result['sensitivities'] = sensitivities
+            result['num_sensitivity_params'] = sensitivities.get('num_params', 0)
+
+        return result
 
     def add_trade_incremental(self, new_trade: TradeData,
                               existing_portfolio_values: np.ndarray,
                               rates: np.ndarray,
                               pricing_times: np.ndarray,
                               ctrparty_surv: np.ndarray,
-                              company_surv: np.ndarray) -> dict:
+                              company_surv: np.ndarray,
+                              compute_sensitivities: bool = False) -> dict:
         """Add a new trade incrementally (reusing kernels).
 
         This is the key optimization: if the trade type already exists,
         we reuse the compiled kernel with 0 compilation time.
+
+        Args:
+            new_trade: TradeData for the new trade
+            existing_portfolio_values: (num_paths, num_pricing_times) current portfolio
+            rates: (num_paths, num_steps) short rate paths
+            pricing_times: (num_pricing_times,) pricing grid
+            ctrparty_surv: (num_pricing_times,) counterparty survival curve
+            company_surv: (num_pricing_times,) company survival curve
+            compute_sensitivities: if True, compute XVA sensitivities via bump-and-revalue
+
+        Returns:
+            dict with CVA, DVA, timings, and optionally sensitivities
         """
         # Check if kernel exists
         was_cached = new_trade.trade_type in self.kernel_cache.kernels
@@ -646,14 +789,20 @@ class ModularXVAEngine:
         # Update portfolio values
         updated_portfolio = existing_portfolio_values + new_trade_values
 
-        # Recompute CVA/DVA
+        # Recompute CVA/DVA (and sensitivities if requested)
         t1 = time.perf_counter()
-        cva, dva, pee, nee = self.compute_cva_dva(
-            updated_portfolio, pricing_times, ctrparty_surv, company_surv
+        cva, dva, pee, nee, sensitivities = self.compute_cva_dva(
+            updated_portfolio, pricing_times, ctrparty_surv, company_surv,
+            compute_sensitivities=compute_sensitivities
         )
         cva_time = time.perf_counter() - t1
 
-        return {
+        # Extract sensitivity timing if computed
+        sensitivity_time = 0.0
+        if sensitivities is not None:
+            sensitivity_time = sensitivities.get('sensitivity_time_sec', 0.0)
+
+        result = {
             'cva': cva,
             'dva': dva,
             'pee': pee,
@@ -662,9 +811,16 @@ class ModularXVAEngine:
             'updated_portfolio_values': updated_portfolio,
             'valuation_time_sec': valuation_time,
             'cva_time_sec': cva_time,
+            'sensitivity_time_sec': sensitivity_time,
             'kernel_reused': was_cached,
             'kernel_compile_time_sec': kernel_stats['total_compile_time_sec']
         }
+
+        if sensitivities is not None:
+            result['sensitivities'] = sensitivities
+            result['num_sensitivity_params'] = sensitivities.get('num_params', 0)
+
+        return result
 
 
 # =============================================================================
@@ -985,6 +1141,58 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 51200,
             kernels_reused=1 if result3b['kernel_reused'] else 0,
         )
 
+    # === Scenario 4: Sensitivity Computation ===
+    if scenario in ['all', 'sensitivities']:
+        print()
+        print("=" * 70)
+        print("  SCENARIO 4: Sensitivity Computation (Bump-and-Revalue)")
+        print("=" * 70)
+
+        # Run full XVA with sensitivities
+        result_sens = engine.run_full_xva(
+            trades, randoms, pricing_times, ctrparty_surv, company_surv,
+            compute_sensitivities=True
+        )
+
+        print(f"\n  Results:")
+        print(f"    CVA: {result_sens['cva']:.6f}")
+        print(f"    DVA: {result_sens['dva']:.6f}")
+        if 'sensitivities' in result_sens:
+            sens = result_sens['sensitivities']
+            print(f"    Sensitivity params: {sens.get('num_params', 0)}")
+            print(f"    Method: {sens.get('method', 'unknown')}")
+            # Show sample sensitivities
+            dcva = sens.get('dcva_dv', [])
+            ddva = sens.get('ddva_dv', [])
+            if len(dcva) > 0:
+                print(f"    d(CVA)/d(V_0): {dcva[0]:.6f}")
+                print(f"    d(CVA)/d(V_mid): {dcva[len(dcva)//2]:.6f}")
+                print(f"    d(DVA)/d(V_0): {ddva[0]:.6f}")
+                print(f"    d(DVA)/d(V_mid): {ddva[len(ddva)//2]:.6f}")
+        print(f"\n  Timing:")
+        print(f"    Rate simulation: {result_sens['rates_time_sec']*1000:.1f}ms")
+        print(f"    Trade valuation: {result_sens['valuation_time_sec']*1000:.1f}ms")
+        print(f"    CVA/DVA calc:    {result_sens['cva_time_sec']*1000:.1f}ms")
+        print(f"    Sensitivity:     {result_sens.get('sensitivity_time_sec', 0)*1000:.1f}ms")
+        print(f"    Total:           {result_sens['total_time_sec']*1000:.1f}ms")
+
+        # Log to CSV
+        log_modular_result(
+            scenario='sensitivities',
+            num_trades=num_trades,
+            num_paths=num_paths,
+            num_steps=grid['num_steps'],
+            num_pricing_times=grid['num_pricing_times'],
+            num_trade_types=num_trade_types,
+            cva=result_sens['cva'],
+            dva=result_sens['dva'],
+            eval_time=result_sens['valuation_time_sec'] + result_sens['cva_time_sec'],
+            compile_time=result_sens['kernel_stats']['total_compile_time_sec'],
+            total_time=result_sens['total_time_sec'],
+            kernels_compiled=result_sens['kernel_stats']['kernels_compiled'],
+            kernels_reused=result_sens['kernel_stats']['kernels_reused'],
+        )
+
     # === Final Summary ===
     print()
     print("=" * 70)
@@ -1008,7 +1216,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-trades', '-t', type=int, default=100)
     parser.add_argument('--num-trade-types', type=int, default=5)
     parser.add_argument('--mc-paths', '-m', type=int, default=51200)
-    parser.add_argument('--scenario', choices=['all', 'full', 'market_update', 'new_trade'],
+    parser.add_argument('--scenario', choices=['all', 'full', 'market_update', 'new_trade', 'sensitivities'],
                         default='all')
 
     args = parser.parse_args()

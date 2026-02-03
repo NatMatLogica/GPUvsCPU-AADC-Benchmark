@@ -12,8 +12,8 @@ This allows:
   - Market data update: recompute trade values, reuse kernel
 
 Usage:
-    python xva_aadc_modular.py --num-trades 100 --mc-paths 1000
-    python xva_aadc_modular.py --scenario new_trade --num-trades 100
+    python xva_aadc_modular.py --num-trades 100 --mc-paths 1000 --threads 8
+    python xva_aadc_modular.py --scenario new_trade --num-trades 100 --threads 16
 
 Version: 1.0.0
 """
@@ -55,11 +55,13 @@ class AADCCSACVAKernel:
     """
 
     def __init__(self, num_pricing_times: int, csa_params: dict,
-                 ctrparty_surv: np.ndarray, company_surv: np.ndarray):
+                 ctrparty_surv: np.ndarray, company_surv: np.ndarray,
+                 num_threads: int = 4):
         self.num_pricing_times = num_pricing_times
         self.csa_params = csa_params
         self.ctrparty_surv = ctrparty_surv
         self.company_surv = company_surv
+        self.num_threads = num_threads
         self.kernel_recorded = False
         self.funcs = None
         self.v_handles = []
@@ -154,14 +156,18 @@ class AADCCSACVAKernel:
         self.kernel_recorded = True
         self.recording_time = time.perf_counter() - start
 
-    def evaluate(self, v_portfolio_paths: np.ndarray) -> Tuple[float, float]:
+    def evaluate(self, v_portfolio_paths: np.ndarray,
+                 compute_sensitivities: bool = False) -> Tuple[float, float, Optional[dict]]:
         """Evaluate kernel on portfolio values.
 
         Args:
             v_portfolio_paths: (num_paths, num_pricing_times) array
+            compute_sensitivities: if True, compute d(CVA)/d(V_t) and d(DVA)/d(V_t)
 
         Returns:
-            (cva, dva) averaged across paths
+            (cva, dva, sensitivities) where sensitivities is None or dict with:
+              - 'dcva_dv': (num_pricing_times,) array of d(CVA)/d(V_t)
+              - 'ddva_dv': (num_pricing_times,) array of d(DVA)/d(V_t)
         """
         if not self.kernel_recorded:
             self.record_kernel()
@@ -169,19 +175,27 @@ class AADCCSACVAKernel:
         num_paths = v_portfolio_paths.shape[0]
 
         if not AADC_AVAILABLE:
-            # NumPy fallback
-            return self._evaluate_numpy(v_portfolio_paths)
+            # NumPy fallback (no sensitivities)
+            cva, dva = self._evaluate_numpy(v_portfolio_paths)
+            return cva, dva, None
 
         # AADC evaluation - batch all paths at once
         # inputs: dict mapping handle -> array of values (one per path)
         inputs = {self.v_handles[t]: v_portfolio_paths[:, t]
                   for t in range(self.num_pricing_times)}
 
-        # request: which outputs to compute (no gradients needed for now)
-        request = {self.cva_output: [], self.dva_output: []}
+        # request: which outputs to compute and which gradients
+        if compute_sensitivities:
+            # Request gradients w.r.t. all V_t inputs
+            request = {
+                self.cva_output: self.v_handles,
+                self.dva_output: self.v_handles,
+            }
+        else:
+            request = {self.cva_output: [], self.dva_output: []}
 
         # Create thread pool
-        workers = aadc.ThreadPool(4)
+        workers = aadc.ThreadPool(self.num_threads)
 
         # Evaluate kernel for all paths at once
         results = aadc.evaluate(self.funcs, request, inputs, workers)
@@ -190,7 +204,27 @@ class AADCCSACVAKernel:
         cva_paths = np.array(results[0][self.cva_output])
         dva_paths = np.array(results[0][self.dva_output])
 
-        return np.mean(cva_paths), np.mean(dva_paths)
+        sensitivities = None
+        if compute_sensitivities and len(results) > 1:
+            # results[1] contains gradients: {output_handle: {input_handle: gradient_array}}
+            dcva_dv = np.zeros(self.num_pricing_times)
+            ddva_dv = np.zeros(self.num_pricing_times)
+
+            for t in range(self.num_pricing_times):
+                handle = self.v_handles[t]
+                # Average gradient across paths
+                if self.cva_output in results[1] and handle in results[1][self.cva_output]:
+                    dcva_dv[t] = np.mean(results[1][self.cva_output][handle])
+                if self.dva_output in results[1] and handle in results[1][self.dva_output]:
+                    ddva_dv[t] = np.mean(results[1][self.dva_output][handle])
+
+            sensitivities = {
+                'dcva_dv': dcva_dv,
+                'ddva_dv': ddva_dv,
+                'num_params': self.num_pricing_times * 2,  # CVA + DVA sensitivities
+            }
+
+        return np.mean(cva_paths), np.mean(dva_paths), sensitivities
 
     def _evaluate_numpy(self, v_portfolio_paths: np.ndarray) -> Tuple[float, float]:
         """NumPy fallback when AADC not available."""
@@ -329,16 +363,17 @@ class AADCModularXVAEngine:
 
     def __init__(self, num_pricing_times: int, hw_params: dict,
                  csa_params: dict, ctrparty_surv: np.ndarray,
-                 company_surv: np.ndarray):
+                 company_surv: np.ndarray, num_threads: int = 4):
         self.num_pricing_times = num_pricing_times
         self.hw_params = hw_params
         self.csa_params = csa_params
         self.ctrparty_surv = ctrparty_surv
         self.company_surv = company_surv
+        self.num_threads = num_threads
 
         # CSA+CVA kernel (recorded once, reused for all evaluations)
         self.csa_cva_kernel = AADCCSACVAKernel(
-            num_pricing_times, csa_params, ctrparty_surv, company_surv
+            num_pricing_times, csa_params, ctrparty_surv, company_surv, num_threads
         )
 
     def record_kernel(self):
@@ -361,13 +396,33 @@ class AADCModularXVAEngine:
 
         return portfolio_values
 
-    def compute_cva_dva(self, portfolio_values: np.ndarray) -> Tuple[float, float]:
-        """Compute CVA/DVA using cached AADC kernel."""
-        return self.csa_cva_kernel.evaluate(portfolio_values)
+    def compute_cva_dva(self, portfolio_values: np.ndarray,
+                        compute_sensitivities: bool = False) -> Tuple[float, float, Optional[dict]]:
+        """Compute CVA/DVA using cached AADC kernel.
+
+        Args:
+            portfolio_values: (num_paths, num_pricing_times) array
+            compute_sensitivities: if True, compute d(CVA)/d(V_t) and d(DVA)/d(V_t)
+
+        Returns:
+            (cva, dva, sensitivities) where sensitivities is None or dict
+        """
+        return self.csa_cva_kernel.evaluate(portfolio_values, compute_sensitivities)
 
     def run_full_xva(self, trades: List[dict], rates: np.ndarray,
-                     pricing_times: np.ndarray) -> dict:
-        """Run full XVA calculation."""
+                     pricing_times: np.ndarray,
+                     compute_sensitivities: bool = False) -> dict:
+        """Run full XVA calculation.
+
+        Args:
+            trades: List of trade dictionaries
+            rates: (num_paths, num_steps) short rate paths
+            pricing_times: (num_pricing_times,) pricing grid
+            compute_sensitivities: if True, compute XVA sensitivities via AAD
+
+        Returns:
+            dict with CVA, DVA, timings, and optionally sensitivities
+        """
         # Record kernel if not done
         if not self.csa_cva_kernel.kernel_recorded:
             self.record_kernel()
@@ -377,25 +432,47 @@ class AADCModularXVAEngine:
         portfolio_values = self.value_portfolio(trades, rates, pricing_times)
         valuation_time = time.perf_counter() - t0
 
-        # Compute CVA/DVA
+        # Compute CVA/DVA (and sensitivities if requested)
         t1 = time.perf_counter()
-        cva, dva = self.compute_cva_dva(portfolio_values)
+        cva, dva, sensitivities = self.compute_cva_dva(portfolio_values, compute_sensitivities)
         cva_time = time.perf_counter() - t1
 
-        return {
+        # Separate timing for sensitivities if computed
+        sensitivity_time = cva_time if compute_sensitivities else 0.0
+
+        result = {
             'cva': cva,
             'dva': dva,
             'portfolio_values': portfolio_values,
             'valuation_time_sec': valuation_time,
             'cva_time_sec': cva_time,
             'kernel_recording_sec': self.csa_cva_kernel.recording_time,
+            'sensitivity_time_sec': sensitivity_time,
         }
+
+        if sensitivities is not None:
+            result['sensitivities'] = sensitivities
+            result['num_sensitivity_params'] = sensitivities.get('num_params', 0)
+
+        return result
 
     def add_trade_incremental(self, new_trade: dict,
                               existing_portfolio_values: np.ndarray,
                               rates: np.ndarray,
-                              pricing_times: np.ndarray) -> dict:
-        """Add new trade incrementally (reuses kernel)."""
+                              pricing_times: np.ndarray,
+                              compute_sensitivities: bool = False) -> dict:
+        """Add new trade incrementally (reuses kernel).
+
+        Args:
+            new_trade: New trade dictionary
+            existing_portfolio_values: (num_paths, num_pricing_times) current portfolio
+            rates: (num_paths, num_steps) short rate paths
+            pricing_times: (num_pricing_times,) pricing grid
+            compute_sensitivities: if True, compute XVA sensitivities via AAD
+
+        Returns:
+            dict with CVA, DVA, timings, and optionally sensitivities
+        """
         # Value new trade
         t0 = time.perf_counter()
         new_trade_values = value_trade_hw(new_trade, rates, pricing_times, self.hw_params)
@@ -406,18 +483,28 @@ class AADCModularXVAEngine:
 
         # Compute CVA/DVA (reuses kernel)
         t1 = time.perf_counter()
-        cva, dva = self.compute_cva_dva(updated_portfolio)
+        cva, dva, sensitivities = self.compute_cva_dva(updated_portfolio, compute_sensitivities)
         cva_time = time.perf_counter() - t1
 
-        return {
+        # Separate timing for sensitivities if computed
+        sensitivity_time = cva_time if compute_sensitivities else 0.0
+
+        result = {
             'cva': cva,
             'dva': dva,
             'new_trade_values': new_trade_values,
             'updated_portfolio_values': updated_portfolio,
             'valuation_time_sec': valuation_time,
             'cva_time_sec': cva_time,
+            'sensitivity_time_sec': sensitivity_time,
             'kernel_reused': True,  # Always reused after initial recording
         }
+
+        if sensitivities is not None:
+            result['sensitivities'] = sensitivities
+            result['num_sensitivity_params'] = sensitivities.get('num_params', 0)
+
+        return result
 
 
 # =============================================================================
@@ -453,10 +540,30 @@ def build_survival_curve(num_times: int, hazard_rate: float = 0.02) -> np.ndarra
 
 
 def log_result(scenario: str, num_trades: int, num_paths: int,
-               num_pricing_times: int, cva: float, dva: float,
+               num_pricing_times: int, num_threads: int, cva: float, dva: float,
                valuation_time: float, cva_time: float,
-               kernel_recording: float, kernel_reused: bool):
-    """Log result to CSV."""
+               kernel_recording: float, kernel_reused: bool,
+               sensitivity_time: float = 0.0):
+    """Log result to CSV.
+
+    Args:
+        scenario: Scenario name
+        num_trades: Number of trades
+        num_paths: Number of MC paths
+        num_pricing_times: Number of pricing times
+        num_threads: Number of AADC threads
+        cva: CVA result
+        dva: DVA result
+        valuation_time: Trade valuation time (sec)
+        cva_time: CVA/DVA computation time (sec)
+        kernel_recording: Kernel recording time (sec)
+        kernel_reused: Whether kernel was reused
+        sensitivity_time: Time spent on sensitivity computation (sec)
+    """
+    # For AADC, sensitivity computation is included in cva_time
+    # (single reverse sweep gets all gradients)
+    total_eval_time = valuation_time + cva_time
+
     row = {
         'timestamp': datetime.now().isoformat(),
         'model_name': f'xva_aadc_modular_{scenario}',
@@ -465,15 +572,15 @@ def log_result(scenario: str, num_trades: int, num_paths: int,
         'num_mc_paths': num_paths,
         'num_model_steps': 365,
         'num_pricing_times': num_pricing_times,
-        'num_sensitivity_params': num_pricing_times,  # Kernel inputs
-        'num_threads': 1,
+        'num_sensitivity_params': num_pricing_times * 2,  # CVA + DVA sensitivities
+        'num_threads': num_threads,
         'backend': 'aadc_modular',
-        'mode': 'pricing_with_greeks',
+        'mode': 'pricing_with_greeks' if sensitivity_time > 0 or scenario == 'sensitivities' else 'pricing_only',
         'cva_result': cva,
         'dva_result': dva,
-        'eval_time_sec': valuation_time + cva_time,
-        'sensitivity_time_sec': valuation_time + cva_time,
-        'total_time_sec': valuation_time + cva_time + kernel_recording,
+        'eval_time_sec': total_eval_time,
+        'sensitivity_time_sec': sensitivity_time if sensitivity_time > 0 else cva_time,
+        'total_time_sec': total_eval_time + kernel_recording,
         'kernel_recording_sec': kernel_recording,
         'num_params_bumped': 0 if kernel_reused else 1,
         'speedup_vs_cpu': 1 if kernel_reused else 0,
@@ -481,7 +588,7 @@ def log_result(scenario: str, num_trades: int, num_paths: int,
         'max_dva_diff': 0.0,
         'gpu_kernel_time_sec': 0.0,
         'memory_mb': 0.0,
-        'throughput_paths_per_sec': num_paths / (valuation_time + cva_time) if (valuation_time + cva_time) > 0 else 0,
+        'throughput_paths_per_sec': num_paths / total_eval_time if total_eval_time > 0 else 0,
         'status': 'success',
     }
     write_xva_log(LOG_FILE, [row])
@@ -493,7 +600,7 @@ def log_result(scenario: str, num_trades: int, num_paths: int,
 # =============================================================================
 
 def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
-                  scenario: str = 'all'):
+                  num_threads: int = 4, scenario: str = 'all'):
     """Run AADC modular XVA benchmark."""
 
     print("=" * 70)
@@ -501,6 +608,7 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
     print("=" * 70)
     print(f"  Trades: {num_trades}")
     print(f"  MC Paths: {num_paths}")
+    print(f"  Threads: {num_threads}")
     print(f"  AADC available: {AADC_AVAILABLE}")
     print()
 
@@ -532,7 +640,8 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
 
     # Create engine
     engine = AADCModularXVAEngine(
-        num_pricing_times, hw_params, csa_params, ctrparty_surv, company_surv
+        num_pricing_times, hw_params, csa_params, ctrparty_surv, company_surv,
+        num_threads=num_threads
     )
 
     # === Scenario 1: Full Portfolio (record kernel) ===
@@ -553,7 +662,7 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
         print(f"    CVA/DVA calc:     {result['cva_time_sec']*1000:.1f}ms")
 
         log_result('full_portfolio', num_trades, num_paths, num_pricing_times,
-                   result['cva'], result['dva'],
+                   num_threads, result['cva'], result['dva'],
                    result['valuation_time_sec'], result['cva_time_sec'],
                    result['kernel_recording_sec'], kernel_reused=False)
 
@@ -578,19 +687,21 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
         valuation_time2 = time.perf_counter() - t0
 
         t1 = time.perf_counter()
-        cva2, dva2 = engine.compute_cva_dva(portfolio_values2)
+        cva2, dva2, sens2 = engine.compute_cva_dva(portfolio_values2, compute_sensitivities=True)
         cva_time2 = time.perf_counter() - t1
 
-        print(f"\n  Results (kernel reused):")
+        print(f"\n  Results (kernel reused, with sensitivities):")
         print(f"    CVA: {cva2:.6f}")
         print(f"    DVA: {dva2:.6f}")
+        if sens2:
+            print(f"    Sensitivity params: {sens2.get('num_params', 0)}")
         print(f"\n  Timing:")
         print(f"    Kernel recording: 0.0ms (REUSED)")
         print(f"    Trade valuation:  {valuation_time2*1000:.1f}ms")
-        print(f"    CVA/DVA calc:     {cva_time2*1000:.1f}ms")
+        print(f"    CVA/DVA + sens:   {cva_time2*1000:.1f}ms")
 
         log_result('market_update', num_trades, num_paths, num_pricing_times,
-                   cva2, dva2, valuation_time2, cva_time2,
+                   num_threads, cva2, dva2, valuation_time2, cva_time2,
                    kernel_recording=0.0, kernel_reused=True)
 
     # === Scenario 3: New Trade (reuse kernel) ===
@@ -620,9 +731,48 @@ def run_benchmark(num_trades: int = 100, num_paths: int = 1000,
         print(f"    CVA/DVA calc:        {result3['cva_time_sec']*1000:.1f}ms")
 
         log_result('new_trade', num_trades + 1, num_paths, num_pricing_times,
-                   result3['cva'], result3['dva'],
+                   num_threads, result3['cva'], result3['dva'],
                    result3['valuation_time_sec'], result3['cva_time_sec'],
                    kernel_recording=0.0, kernel_reused=True)
+
+    # === Scenario 4: Sensitivity Computation ===
+    if scenario in ['all', 'sensitivities']:
+        print()
+        print("=" * 70)
+        print("  SCENARIO 4: Sensitivity Computation (AADC Reverse-Mode AD)")
+        print("=" * 70)
+
+        # Run full XVA with sensitivities
+        result_sens = engine.run_full_xva(trades, rates, pricing_times,
+                                          compute_sensitivities=True)
+
+        print(f"\n  Results:")
+        print(f"    CVA: {result_sens['cva']:.6f}")
+        print(f"    DVA: {result_sens['dva']:.6f}")
+        if 'sensitivities' in result_sens:
+            sens = result_sens['sensitivities']
+            print(f"    Sensitivity params: {sens.get('num_params', 0)}")
+            # Show sample sensitivities
+            dcva = sens.get('dcva_dv', np.array([]))
+            ddva = sens.get('ddva_dv', np.array([]))
+            if len(dcva) > 0:
+                print(f"    d(CVA)/d(V_0): {dcva[0]:.6f}")
+                print(f"    d(CVA)/d(V_mid): {dcva[len(dcva)//2]:.6f}")
+                print(f"    d(DVA)/d(V_0): {ddva[0]:.6f}")
+                print(f"    d(DVA)/d(V_mid): {ddva[len(ddva)//2]:.6f}")
+        print(f"\n  Timing:")
+        print(f"    Kernel recording:  {result_sens['kernel_recording_sec']*1000:.1f}ms")
+        print(f"    Trade valuation:   {result_sens['valuation_time_sec']*1000:.1f}ms")
+        print(f"    CVA/DVA + sens:    {result_sens['cva_time_sec']*1000:.1f}ms")
+        print(f"    Sensitivity time:  {result_sens.get('sensitivity_time_sec', 0)*1000:.1f}ms")
+        print()
+        print("  Note: AADC computes sensitivities in a SINGLE reverse sweep!")
+        print("  No bump-and-revalue required. O(1) vs O(N) complexity.")
+
+        log_result('sensitivities', num_trades, num_paths, num_pricing_times,
+                   num_threads, result_sens['cva'], result_sens['dva'],
+                   result_sens['valuation_time_sec'], result_sens['cva_time_sec'],
+                   result_sens['kernel_recording_sec'], kernel_reused=True)
 
     # === Summary ===
     print()
@@ -644,7 +794,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='AADC Modular XVA Benchmark')
     parser.add_argument('--num-trades', '-t', type=int, default=100)
     parser.add_argument('--mc-paths', '-m', type=int, default=1000)
-    parser.add_argument('--scenario', choices=['all', 'full', 'market_update', 'new_trade'],
+    parser.add_argument('--threads', type=int, default=4,
+                        help='Number of AADC threads (default: 4)')
+    parser.add_argument('--scenario', choices=['all', 'full', 'market_update', 'new_trade', 'sensitivities'],
                         default='all')
 
     args = parser.parse_args()
@@ -652,5 +804,6 @@ if __name__ == "__main__":
     run_benchmark(
         num_trades=args.num_trades,
         num_paths=args.mc_paths,
+        num_threads=args.threads,
         scenario=args.scenario
     )
