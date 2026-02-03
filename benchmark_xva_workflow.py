@@ -385,6 +385,8 @@ def run_incremental_trade(
     num_mc_paths: int,
     num_threads: int,
     backends: list,
+    t0: int = 0,
+    num_periods: int = 5,
     seed: int = 42,
 ) -> list:
     """
@@ -414,8 +416,9 @@ def run_incremental_trade(
 
     # Generate one additional trade
     trades_new = generate_portfolio(
+        t0=t0,
         num_trades=trades_base.num_trades + 1,
-        num_periods=5,
+        num_periods=num_periods,
         seed=seed + 1000,  # Different seed for new trade
     )
 
@@ -619,15 +622,18 @@ def main():
     # Load configuration
     data = load_init_data(args.input)
     hw = parse_hw_model(data)
-    grid = parse_simulation_grid(data)
-    csa = parse_csa(data)
-    company_surv = parse_survival_curve(data, "CompSurvCurve")
-    ctrparty_surv = parse_survival_curve(data, "CtrpSurvCurve")
+    t0_days = data.get("t0", 0)
+    grid = parse_simulation_grid(data["ModelAndPricingTimes"], t0_days)
+    csa = parse_csa(data["csa"])
+    company_surv = parse_survival_curve(data["CompanySurvivalCurve"], t0_days)
+    ctrparty_surv = parse_survival_curve(data["CounterPartySurvivalCurve"], t0_days)
 
     # Generate base portfolio (100 trades)
+    num_periods = data.get("Portfolio", {}).get("NumPeriods", 5)
     trades = generate_portfolio(
+        t0=t0_days,
         num_trades=args.num_trades,
-        num_periods=data.get("Portfolio", {}).get("NumPeriods", 5),
+        num_periods=num_periods,
         seed=17,  # Match C++ seed for reproducibility
     )
 
@@ -653,6 +659,8 @@ def main():
             num_mc_paths=args.mc_paths,
             num_threads=args.threads,
             backends=args.backends,
+            t0=t0_days,
+            num_periods=num_periods,
             seed=args.seed,
         )
         all_results.extend(results)
