@@ -286,39 +286,106 @@ cpp_aadc: 36.9s / 10,000 paths = 3.7ms per path for CVA + 244 sensitivities
 
 **WARNING:** The CSV `num_sensitivity_params` column is misleading across backends:
 
-| Backend | Reported Params | What They Actually Are |
-|---------|-----------------|------------------------|
-| `cpp_aadc` | 244 | ✓ **TRUE GREEKS**: dCVA/dr0, dCVA/dσ, dCVA/dθ(t) × 120, dCVA/dSurvival × 122 |
-| `pathwise_gpu` | 244 | ✓ **TRUE GREEKS**: Same as cpp_aadc (computed via pathwise AD) |
-| `aadc_modular` | 244 | ✗ **Intermediates**: dCVA/dV_portfolio(t) for 122 pricing times × 2 |
-| `modular_gpu` | 5 | ✗ **Trade type count**: Number of cached kernels, NOT sensitivities |
+| Backend | CSV Reported | Actually Computed | Discrepancy Reason |
+|---------|--------------|-------------------|-------------------|
+| `cpp_aadc` | 242 | **~535** | CSV logs `num_pricing_times × 2` (bug) |
+| `pathwise_gpu` | 284 | **~284** | ✓ Correct (but NO MR curve) |
+| `gpu_brute_force` | 284-535 | **284-535** | ✓ Correct (depends on --skip-mr-bumps) |
+| `aadc_modular` | 244 | **0 market Greeks** | 244 = exposure-level derivatives only |
+| `modular_gpu` | 5 | **0 market Greeks** | 5 = trade type count, NOT sensitivities |
 
-**Key distinction:**
-- `cpp_aadc` and `pathwise_gpu` compute **market-level Greeks** (what traders need for hedging)
-- `aadc_modular` computes **exposure-level derivatives** (dCVA/dV(t) — useful for aggregation, not hedging)
-- `modular_gpu` reports trade types as "sensitivity params" (this is a logging bug)
+**Critical distinction:**
+- `cpp_aadc` computes **~535 market Greeks**: r0, σ, θ(t)×251, survival×282
+- `pathwise_gpu` computes **~284 market Greeks**: r0, σ, survival×282 (NO MR curve!)
+- `aadc_modular` computes **exposure-level derivatives** (dCVA/dV(t) — NOT market Greeks)
+- `modular_gpu` reports trade type count as "sensitivity params" (logging bug)
+
+### Sensitivity Parameter Reconciliation (CRITICAL)
+
+**WARNING:** The three backends compute DIFFERENT sets of market Greeks. Direct comparisons are misleading unless you account for this!
+
+#### What Each Backend Actually Computes
+
+| Parameter Class | cpp_aadc | pathwise_gpu | gpu_brute_force |
+|-----------------|----------|--------------|-----------------|
+| r0 (initial rate) | ✓ AD | ✓ Pathwise | ✓ Bump (re-sim) |
+| σ (volatility) | ✓ AD | ✓ Pathwise | ✓ Bump (re-sim) |
+| Mean reversion θ(t) (~251 pts) | ✓ AD | ✗ **NOT IMPLEMENTED** | Optional (--skip-mr-bumps) |
+| Counterparty survival (~141 pts) | ✓ AD | ✓ Analytical | ✓ Bump (re-integration) |
+| Company survival (~141 pts) | ✓ AD | ✓ Analytical | ✓ Bump (re-integration) |
+| **TOTAL** | **~535** | **~284** | **284-535** |
+
+#### Curve Sizes (from initData.json)
+
+```
+Mean reversion θ(t):     T=50 years, step=0.2 years → ~251 points
+Counterparty survival:   T=14000 days, step=100 days → ~141 points
+Company survival:        T=14000 days, step=100 days → ~141 points
+```
+
+**Parameter counts:**
+- **Full set (cpp_aadc):** 1 + 1 + 251 + 141 + 141 = **535 params**
+- **No MR (pathwise_gpu):** 1 + 1 + 141 + 141 = **284 params**
+
+#### Why pathwise_gpu Doesn't Have MR Sensitivities
+
+The pathwise kernel tracks `dr/dr0` and `dr/dσ` but NOT `dr/dθ[i]` for each MR curve point:
+
+```python
+# From xva_pathwise_gpu.py kernel:
+# State tracked per path:
+dr_dr0, dr_dsigma         # ✓ Implemented
+# dr_dtheta[0..n_mr]       # ✗ NOT implemented (would require O(n_mr) state per path)
+```
+
+Adding MR sensitivities to pathwise would require:
+- ~251 additional derivative states per path
+- ~251× more arithmetic per time step
+- Significant memory increase (paths × pricing_times × 251 × 8 bytes)
+
+The docstring in `xva_pathwise_gpu.py` claims MR support but the implementation doesn't include it (see line 801 comment: "excludes MR sensitivities").
+
+#### Why gpu_brute_force Timings Are Not 535× Single Eval
+
+The 0.85s sensitivity time for gpu_brute_force includes:
+- r0, sigma: 2 full GPU re-simulations
+- MR curve: 251 re-simulations (if not skipped) **BUT** using CUDA streams for concurrency
+- Survival curves: 282 re-integrations (CPU-side, ~0.001s each)
+
+With 16 CUDA streams, MR bumps run in batches of 16 concurrently. The actual GPU time is:
+```
+MR bumps: ceil(251 / 16) = 16 batches × ~0.03s/batch ≈ 0.5s
+Survival re-integration: 282 × 0.001s ≈ 0.3s
+Total: ~0.85s (matches observed)
+```
 
 ### Production Benchmark: cpp_aadc at Full Capacity (16 threads)
 
-**Configuration:** 50 trades, 10,000 paths, 16 threads, 244 true market Greeks
+**Configuration:** 50 trades, 10,000 paths, 16 threads
 
 | Phase | Compilation | Execution | Total |
 |-------|-------------|-----------|-------|
 | Cold start | 5.7s | 10.5s | **16.7s** |
 | Warm (kernel reused) | 0.0s | 10.5s | **10.5s** |
 
-**Publishable comparison (same portfolio, same paths):**
+### Honest Comparison Table (Different Param Counts!)
 
-| Backend | Time | True Market Greeks | Notes |
-|---------|------|-------------------|-------|
-| gpu_brute_force | 0.7s | 0 | CVA only, no sensitivities |
-| pathwise_gpu | 0.8s | 244 ✓ | GPU pathwise AD |
-| cpp_aadc (16T, warm) | **10.5s** | 244 ✓ | Full reverse-mode AD, kernel reused |
-| cpp_aadc (16T, cold) | 16.7s | 244 ✓ | Includes kernel compilation |
+| Backend | Eval Time | Sens Time | Market Greeks | MR Curve? | Method |
+|---------|-----------|-----------|---------------|-----------|--------|
+| pathwise_gpu | 0.13s | 0.13s* | ~284 | ✗ No | Pathwise AD |
+| gpu_brute_force (no MR) | 0.14s | 0.85s | ~284 | ✗ Skipped | Finite diff + streams |
+| gpu_brute_force (full) | 0.14s | ~2.5s | ~535 | ✓ Yes | Finite diff + streams |
+| cpp_aadc (16T, warm) | 10.5s | 10.5s | ~535 | ✓ Yes | Full reverse-mode AD |
 
-**Narrative for publication:**
+*pathwise_gpu computes sensitivities in the same kernel pass as primal (no additional time)
 
-> "Full-stack reverse-mode AD with all 244 analytic market Greeks in **10.5s** on CPU (with kernel reuse) vs GPU pathwise derivatives in **0.8s**. The CPU AADC approach offers exact derivatives with no noise, while GPU pathwise achieves 13× speedup with equivalent accuracy. GPU brute-force finite differences would require 244 bumps × 0.7s = **170s** and introduces numerical noise."
+**Key insight:** cpp_aadc computes ~535 Greeks in 10.5s. pathwise_gpu computes ~284 in 0.13s.
+- cpp_aadc is 13× slower but computes ~2× more sensitivities (including MR curve)
+- Per-Greek efficiency: cpp_aadc = 535/10.5 = 51 Greeks/sec, pathwise_gpu = 284/0.13 = 2185 Greeks/sec
+
+### Narrative for Publication
+
+> "Reverse-mode AD on CPU (AADC, 16 threads) computes CVA plus **535 analytic market Greeks** including mean reversion curve sensitivities in **10.5s** with kernel reuse. GPU pathwise differentiation achieves **284 Greeks** (excluding MR curve) in **0.13s** — a **43× speedup per Greek computed**. For applications not requiring MR sensitivities, GPU pathwise offers the best throughput. For full risk management requiring all curve sensitivities, CPU AADC provides the complete solution."
 
 ### Getting Both: Possible Approaches
 

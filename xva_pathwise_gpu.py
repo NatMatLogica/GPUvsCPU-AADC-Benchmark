@@ -1,6 +1,6 @@
 """XVA Pathwise Derivatives: GPU implementation using Numba CUDA.
 
-Computes CVA/DVA and ALL sensitivities in a single Monte Carlo simulation pass
+Computes CVA/DVA and sensitivities in a single Monte Carlo simulation pass
 using pathwise (tangent-mode) automatic differentiation.
 
 Key advantages over bump-and-revalue:
@@ -9,11 +9,17 @@ Key advantages over bump-and-revalue:
 - Exact derivatives (no finite difference truncation error)
 - Perfect GPU parallelism (paths are independent)
 
-Sensitivity parameters computed:
-- r0 (initial short rate)
-- sigma (volatility)
-- Mean reversion curve θ(t): ~251 points
-- Survival curves: computed analytically (no MC needed)
+Sensitivity parameters computed (~284 total):
+- r0 (initial short rate): 1 param, via pathwise AD
+- sigma (volatility): 1 param, via pathwise AD
+- Counterparty survival curve: ~141 params, analytically from exposures
+- Company survival curve: ~141 params, analytically from exposures
+
+NOT computed (would require significant kernel changes):
+- Mean reversion curve θ(t): ~251 params
+  (requires tracking dr/dθ[i] for each curve point per path)
+
+For full ~535 Greeks including MR curve, use cpp_aadc (reverse-mode AD).
 
 Version: 1.0.0
 """
