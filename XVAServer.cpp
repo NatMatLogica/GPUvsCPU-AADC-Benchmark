@@ -236,8 +236,22 @@ int run_pricing(const int threads_num, const std::string input_file) {
     int num_model_steps = (model_T - t0) / model_step;
     int num_pricing_times = (num_model_steps + pricing_freq - 1) / pricing_freq;
 
-    // Count sensitivity parameters (variable inputs)
-    int num_sens = (int)obj->m_request_variable_inputs.size();
+    // Count sensitivity parameters (actual curve points + r0 + sigma)
+    // MR curve: T/step points (T in years, step in years)
+    double mr_T = data_in["Currencies"]["EUR"]["HWMeanReversionCurve"]["T"].get<double>();
+    double mr_step = data_in["Currencies"]["EUR"]["HWMeanReversionCurve"]["step"].get<double>();
+    int n_mr = (int)(mr_T / mr_step);
+
+    // Survival curves: T/step + 1 points (T and step in days, +1 for t=0)
+    int surv_T = data_in["CounterPartySurvivalCurve"]["T"].get<int>();
+    int surv_step = data_in["CounterPartySurvivalCurve"]["step"].get<int>();
+    int n_ctrp_surv = surv_T / surv_step + 1;
+
+    int comp_T = data_in["CompanySurvivalCurve"]["T"].get<int>();
+    int comp_step = data_in["CompanySurvivalCurve"]["step"].get<int>();
+    int n_comp_surv = comp_T / comp_step + 1;
+
+    int num_sens = 2 + n_mr + n_ctrp_surv + n_comp_surv;  // r0, sigma, MR, survival curves
 
     // Extract results
     double primal_cva = 0, primal_dva = 0, aadc_cva = 0, aadc_dva = 0;
