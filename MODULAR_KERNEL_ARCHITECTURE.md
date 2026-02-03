@@ -182,6 +182,61 @@ results = aadc.evaluate(funcs, request, inputs, workers)
 | Market Update | **0ms (reused)** | 1828ms | 3ms | 1830ms |
 | New Trade | **0ms (reused)** | 3ms | 3ms | **6ms** |
 
+### Trade-off: Kernel Reuse vs Sensitivities
+
+**Important:** The modular architecture trades sensitivity computation for kernel reuse.
+
+**C++ AADC (XVAServer.cpp) - Full AD:**
+```
+Kernel records EVERYTHING:
+  r0, σ, θ(t) → Rate simulation → Bond prices → Trade values → CSA → CVA/DVA
+  └─────────────────────── All inside AADC kernel ───────────────────────────┘
+
+Result: CVA + sensitivities to r0, σ, θ[0..250], survival curves (~535 params)
+```
+
+**Python Modular (xva_aadc_modular.py) - Partial AD:**
+```
+NumPy (no AD):           AADC Kernel:
+  r0, σ → rates → trades → V_portfolio(t) → CSA → CVA/DVA
+  └──── Outside kernel ────┘               └─ Inside kernel ─┘
+
+Result: CVA only (no sensitivities to r0, σ, θ!)
+```
+
+The modular version **loses the ability to compute rate sensitivities** because trade valuation happens outside AADC in pure NumPy:
+
+```python
+# xva_aadc_modular.py - trade valuation in NumPy (NOT differentiable)
+def value_trade_hw(trade, rates, pricing_times, hw_params):
+    # Pure NumPy - AADC doesn't see this
+    values = np.zeros((num_paths, num_pricing_times))
+    for pt_idx, t in enumerate(pricing_times):
+        # ... bond pricing in NumPy ...
+    return values
+```
+
+### Comparison: Full AD vs Modular
+
+| Aspect | C++ AADC (Full) | Python Modular |
+|--------|-----------------|----------------|
+| Rate sensitivities (∂CVA/∂r0, ∂CVA/∂σ) | ✓ Yes | ✗ No |
+| Mean reversion θ(t) sensitivities | ✓ Yes | ✗ No |
+| Survival curve sensitivities | ✓ Yes | ✗ No (could add analytically) |
+| Kernel reuse for new trade | ✗ No (recompile all) | ✓ Yes |
+| Kernel reuse for market update | ✓ Yes (eval only) | ✓ Yes |
+| Kernel size | O(trades × CFs) | O(pricing_times) |
+
+### Getting Both: Possible Approaches
+
+To achieve **both** kernel reuse **and** full sensitivities:
+
+1. **GPU Pathwise Derivatives**: Compute sensitivities alongside primal in single pass (implemented in `xva_pathwise_gpu.py`)
+
+2. **Hybrid AADC**: Record trade valuation kernels per trade type (like GPU modular), then chain with CSA kernel
+
+3. **Analytical Sensitivities**: For survival curves, sensitivities can be computed analytically from exposures (no AD needed)
+
 ## CSV Log Model Names Explained
 
 The benchmark logs results to `data/execution_log_xva.csv` with different model names. Understanding these names requires understanding the fundamental difference in how GPU and AADC cache kernels.
