@@ -345,6 +345,53 @@ Adding MR sensitivities to pathwise would require:
 
 The docstring in `xva_pathwise_gpu.py` claims MR support but the implementation doesn't include it (see line 801 comment: "excludes MR sensitivities").
 
+#### Pathwise (Forward-Mode) vs Adjoint (Reverse-Mode) Differentiation
+
+**Important:** `pathwise_gpu` uses **forward-mode (tangent) differentiation**, NOT adjoint (reverse-mode).
+
+**How pathwise works:**
+
+```python
+# Tracks derivative states FORWARD alongside primal:
+r_current          # primal rate
+dr_dr0             # ∂r/∂r0 - propagated forward
+dr_dsigma          # ∂r/∂σ - propagated forward
+
+# Derivative evolution at each time step:
+dr_dr0_new = S * dr_dr0                    # Decays exponentially
+dr_dsigma_new = S * dr_dsigma + V * Z      # Accumulates noise contribution
+
+# Chain rule for outputs:
+dP_dr0 = dP_dr * dr_dr0      # ∂P/∂r0 = ∂P/∂r × ∂r/∂r0
+```
+
+**Comparison of AD modes:**
+
+| Aspect | Pathwise GPU (forward-mode) | AADC (adjoint/reverse-mode) |
+|--------|----------------------------|----------------------------|
+| Direction | Input → Output | Output → Input |
+| Tape recording | None required | Records full computation graph |
+| Memory | O(num params tracked) | O(num operations) |
+| Cost structure | O(1) extra work **per param** tracked | O(1) for **ALL params** via single reverse pass |
+| Best when | Few inputs, many outputs | Many inputs, few outputs (like XVA) |
+
+**Why pathwise is efficient for r0, σ:**
+- Only 2 input parameters to track → 2 extra float64 states per path
+- Derivative evolution is cheap: just multiply and add
+- No tape storage needed
+
+**Why pathwise is expensive for MR curve (~251 params):**
+- Would need 251 derivative states per path (2KB per path)
+- 251× more arithmetic per time step
+- Memory: 4096 paths × 251 params × 8 bytes = 8MB extra
+- Still O(M) but with large constant factor
+
+**True adjoint (what AADC does):**
+- Records entire forward computation to tape
+- Single reverse pass computes ALL 535 sensitivities
+- Memory cost is tape size, not param count
+- This is why AADC can handle 535 params efficiently on CPU
+
 #### Why gpu_brute_force Timings Are Not 535× Single Eval
 
 The 0.85s sensitivity time for gpu_brute_force includes:
