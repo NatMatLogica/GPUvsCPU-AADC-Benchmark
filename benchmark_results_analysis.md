@@ -87,19 +87,28 @@ The default config (`initData.json`) has:
 
 AADC computes all 532 sensitivities in a **single reverse pass** — the cost is O(1) regardless of parameter count. There's no way to "skip" MR sensitivities because they're computed together with all other gradients in the same backward sweep. This is the fundamental advantage of adjoint AD.
 
-**Crossover analysis (100 trades, 10K paths):**
+**Important: 242p vs 532p are different configurations**
 
-| Params | GPU Brute-Force | AADC C++ | Winner |
-|--------|-----------------|----------|--------|
-| 282 (skip MR) | 1,274ms | 4,958ms | GPU 3.9x faster |
-| 532 (all) | 23,647ms | 4,958ms | AADC 4.8x faster |
+The 242-param and 532-param benchmarks use **different model configurations** (different `initData.json` vs `bank_micro.json`), not just different parameter counts. Evidence: CVA values differ significantly (e.g., 0.226 vs 0.053 at 50T). Therefore:
 
-The crossover point is ~300-400 params. Below that, GPU wins (fast re-integration for survival curves). Above that, AADC wins (O(1) vs O(N) for re-simulation bumps).
+- ❌ Cannot compare 242p AADC to 532p AADC eval times
+- ✅ Can compare AADC vs GPU within the **same** configuration
+
+**Valid comparison: 532-param configuration (100 trades, 10K paths)**
+
+| Backend | Eval Time | Sensitivity Time | Total |
+|---------|-----------|------------------|-------|
+| GPU brute-force | 246ms | 23,402ms | **23,647ms** |
+| AADC C++ | 2,322ms | (included) | **4,958ms** |
+
+**AADC is 4.8× faster** than GPU brute-force for the 532-param configuration.
 
 **GPU 532-param breakdown:**
 - r0 + sigma (2 re-sims): ~0.5s
 - MR curve (250 re-sims): **22.9s** ← dominates
 - Survival curves (280 re-integrations): ~0.5s
+
+The O(N) cost of MR bumps (each requiring full MC re-simulation) is what makes GPU brute-force uncompetitive at high param counts.
 
 **Fair benchmark framing:**
 
