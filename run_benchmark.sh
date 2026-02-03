@@ -43,6 +43,7 @@ EXCLUDE=""
 declare -A CONFIGS
 CONFIGS[micro]="bank_micro.json"
 CONFIGS[small]="bank_small.json"
+CONFIGS[mid]="bank_mid.json"
 CONFIGS[medium]="bank_medium.json"
 CONFIGS[large]="bank_large.json"
 

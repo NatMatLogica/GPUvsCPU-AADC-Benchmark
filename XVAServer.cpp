@@ -465,21 +465,164 @@ int run_pricing(const int threads_num, const std::string input_file) {
 
 ////////////////////////////////////////////////////
 //
+//  run_production_benchmark
+//
+//  Production benchmark: measures cold start vs warm run with kernel reuse
+//  1. Cold start: compile kernel + execute
+//  2. Warm run: update market data, reuse kernel, execute
+//
+////////////////////////////////////////////////////
+
+template<class mmType>
+int run_production_benchmark(const int threads_num, const std::string input_file) {
+    json data_in, data_out;
+    std::ifstream i(input_file);
+    if(i.fail()) {
+        std::cout << "Fail to open " << input_file << "\n";
+        return 1;
+    }
+    i >> data_in;
+
+    std::shared_ptr<std::vector<RequestFunction<mmType>>> func_request_cache =
+        std::make_shared<std::vector<RequestFunction<mmType>>>();
+    std::shared_ptr<XVAJobRequest<mmType>> obj;
+    std::atomic<bool> cancel = false;
+
+    // --- Phase 1: Cold Start (compile kernel) ---
+    std::cout << "\n=== PRODUCTION BENCHMARK ===\n";
+    std::cout << "\n--- Phase 1: Cold Start (compile + execute) ---\n";
+
+    obj = std::make_shared<XVAJobRequest<mmType>>(func_request_cache);
+    auto cold_start = std::chrono::high_resolution_clock::now();
+    obj->processRequest(data_in, data_out, threads_num, cancel);
+    auto cold_end = std::chrono::high_resolution_clock::now();
+
+    double cold_total_sec = std::chrono::duration<double>(cold_end - cold_start).count();
+    double cold_compile_sec = 0;
+    if (data_out.contains("compiler data") && data_out["compiler data"].contains("Compilation time")) {
+        cold_compile_sec = data_out["compiler data"]["Compilation time"].get<double>() / 1e6;
+    }
+    double cold_exec_sec = obj->m_aad_time.count() / 1e6;
+
+    std::cout << "  Cold start total: " << std::fixed << std::setprecision(2) << cold_total_sec << "s\n";
+    std::cout << "    Compilation: " << cold_compile_sec << "s\n";
+    std::cout << "    Execution: " << cold_exec_sec << "s\n";
+
+    // Extract CVA/DVA from first run
+    double cva1 = 0, dva1 = 0;
+    if (data_out.contains("AADC results")) {
+        cva1 = data_out["AADC results"]["CVA"].get<double>();
+        dva1 = data_out["AADC results"]["DVA"].get<double>();
+    }
+
+    // --- Phase 2: Warm Run (market data update, reuse kernel) ---
+    std::cout << "\n--- Phase 2: Warm Run (market data update, reuse kernel) ---\n";
+
+    // Modify market data: bump r0 and sigma by 10%
+    double orig_r0 = data_in["Currencies"]["EUR"]["r0"].get<double>();
+    double orig_sigma = data_in["Currencies"]["EUR"]["sigma"].get<double>();
+    data_in["Currencies"]["EUR"]["r0"] = orig_r0 * 1.1;
+    data_in["Currencies"]["EUR"]["sigma"] = orig_sigma * 1.1;
+    std::cout << "  Updated r0: " << orig_r0 << " -> " << orig_r0 * 1.1 << "\n";
+    std::cout << "  Updated sigma: " << orig_sigma << " -> " << orig_sigma * 1.1 << "\n";
+
+    // Reuse same object (kernel cache preserved)
+    json data_out2;
+    auto warm_start = std::chrono::high_resolution_clock::now();
+    obj->processRequest(data_in, data_out2, threads_num, cancel);
+    auto warm_end = std::chrono::high_resolution_clock::now();
+
+    double warm_total_sec = std::chrono::duration<double>(warm_end - warm_start).count();
+    double warm_compile_sec = 0;
+    if (data_out2.contains("compiler data") && data_out2["compiler data"].contains("Compilation time")) {
+        warm_compile_sec = data_out2["compiler data"]["Compilation time"].get<double>() / 1e6;
+    }
+    double warm_exec_sec = obj->m_aad_time.count() / 1e6;
+
+    std::cout << "  Warm run total: " << warm_total_sec << "s\n";
+    std::cout << "    Compilation: " << warm_compile_sec << "s (should be ~0 if kernel reused)\n";
+    std::cout << "    Execution: " << warm_exec_sec << "s\n";
+
+    // Extract CVA/DVA from second run
+    double cva2 = 0, dva2 = 0;
+    if (data_out2.contains("AADC results")) {
+        cva2 = data_out2["AADC results"]["CVA"].get<double>();
+        dva2 = data_out2["AADC results"]["DVA"].get<double>();
+    }
+
+    // --- Summary ---
+    std::cout << "\n=== PRODUCTION BENCHMARK SUMMARY ===\n";
+    std::cout << "                      Cold Start    Warm Run    Speedup\n";
+    std::cout << "  Compilation:        " << std::setw(8) << cold_compile_sec << "s    "
+              << std::setw(8) << warm_compile_sec << "s\n";
+    std::cout << "  Execution:          " << std::setw(8) << cold_exec_sec << "s    "
+              << std::setw(8) << warm_exec_sec << "s\n";
+    std::cout << "  Total:              " << std::setw(8) << cold_total_sec << "s    "
+              << std::setw(8) << warm_total_sec << "s    "
+              << std::setprecision(1) << (cold_total_sec / warm_total_sec) << "x\n";
+    std::cout << "\n  CVA (cold): " << cva1 << "  CVA (warm): " << cva2 << "\n";
+    std::cout << "  DVA (cold): " << dva1 << "  DVA (warm): " << dva2 << "\n";
+
+    // Save results
+    std::ofstream all_res("all_results.json");
+    all_res << std::setw(4) << data_out2 << std::endl;
+    all_res.close();
+
+    return 0;
+}
+
+////////////////////////////////////////////////////
+//
 //  Main
-//  
-//  argv:
-//  string    Path to XVA task data
-//  int       AVX: 256/512
-//  int       Number of threads
+//
+//  Usage:
+//    ./xva_server <config.json> <mc_paths> <threads> [mode]
+//
+//  For production benchmark:
+//    ./xva_server <config.json> <mc_paths> <threads> production [num_trades]
+//
+//  Defaults: threads=16, num_trades=100
 //
 ////////////////////////////////////////////////////
 
 int main (int argc, char* argv[]) {
-	int num_threads(1);
-	std::string input_file("../Pricing/initData.json");
-	if (argc > 3) num_threads = atoi(argv[3]);
-    if (argc > 1) input_file=argv[1];
-#if AADC_512 
+    int num_threads = 16;  // Default threads
+    int num_trades = 100;  // Default trades for production benchmark
+    std::string input_file("../Pricing/initData.json");
+    std::string mode = "";
+
+    if (argc > 1) input_file = argv[1];
+    if (argc > 3) num_threads = atoi(argv[3]);
+    if (argc > 4) mode = argv[4];
+    if (argc > 5) num_trades = atoi(argv[5]);
+
+    // Production benchmark mode
+    if (mode == "production") {
+        // Override NumRandomTrades in the config
+        json data_in;
+        std::ifstream i(input_file);
+        if (i.fail()) {
+            std::cout << "Fail to open " << input_file << "\n";
+            return 1;
+        }
+        i >> data_in;
+        i.close();
+
+        // Set trade count
+        data_in["Portfolio"]["NumRandomTrades"] = num_trades;
+        std::cout << "Production benchmark: " << num_trades << " trades, "
+                  << num_threads << " threads\n";
+
+        // Write modified config to temp file
+        std::string temp_file = ".tmp_production_config.json";
+        std::ofstream o(temp_file);
+        o << std::setw(4) << data_in << std::endl;
+        o.close();
+
+        return run_production_benchmark<__m256d>(num_threads, temp_file);
+    }
+
+#if AADC_512
     if (argc > 2 && atoi(argv[2]) == 512) return run_pricing<__m512d>(num_threads, input_file);
     else
 #endif
