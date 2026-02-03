@@ -58,7 +58,7 @@
     "UseMCPathBoundForPrimal": true,
     "MCPathsBoundForPrimal": 1024,
     "Forward Only": false,
-    "Primal Is Requred": true,
+    "Primal Is Requred": false,
     "Adept": false,
     "Primal and Bumps Are Required": false,
     "Selective bumps": false
