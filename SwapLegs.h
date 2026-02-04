@@ -42,7 +42,7 @@ public:
         mdouble price(0.);
         const typename Market::DiscountCurve& curve=m.getDiscountCurve();
         for (int i = mFirstCfIndx; i < mTimes.size(); ++i) {
-		if (idouble::recording) CAAD_LoopPulse(i - mFirstCfIndx);
+		if (idouble::isRecording()) CAAD_LoopPulse(i - mFirstCfIndx);
             price = price + mAmounts[i] * curve(mTimes[i]);
         }
         return price;
@@ -121,7 +121,7 @@ public:
         const typename Market::DiscountCurve& curve=m.getDiscountCurve();
         const typename Market::ProjectCurveT& proj_curve=m.getProjectCurve(m_spread_id); 
         for (int i = mFirstCfIndx; i < mPayTimes.size(); ++i) {
-            if (idouble::recording) CAAD_LoopPulse(i - mFirstCfIndx);
+            if (idouble::isRecording()) CAAD_LoopPulse(i - mFirstCfIndx);
             mdouble fwd;
             if (mStartTimes[i] >= t) {
                 fwd = (proj_curve(mStartTimes[i]) / proj_curve(mEndTimes[i]) - 1.0)
